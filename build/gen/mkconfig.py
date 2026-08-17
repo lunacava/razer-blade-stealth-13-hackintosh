@@ -123,7 +123,30 @@ SSDTS = ["SSDT-XOSI.aml", "SSDT-PLUG.aml", "SSDT-PNLF.aml",
          # See the header comments in build/ACPI-src/SSDT-{EC,AWAC-DISABLE}.dsl
          # for the full derivation, including why EC0 is left enabled (battery)
          # and why these use _OSI rather than XOSI.
-         "SSDT-EC.aml", "SSDT-AWAC-DISABLE.aml"]
+         "SSDT-EC.aml", "SSDT-AWAC-DISABLE.aml",
+         # SSDT-PMC: added after the Sonoma installer froze twice at the same
+         # point ("~18 minutes remaining") with pointer, keyboard (Caps Lock
+         # LED dead) and display all dead at once -- i.e. the whole machine,
+         # which is what an SMM hang looks like.  This is a 300-series PCH and
+         # the official sample says it outright: "On certain implementations,
+         # including APTIO V, PMC initialisation is required for NVRAM access.
+         # Otherwise it will freeze in SMM mode."  This firmware's ACPI OEM is
+         # ALASKA / A M I = APTIO, and it provides no Device (PMCR) / "APP9876"
+         # at all -- only the generic PNP0C02 + _UID "PCHRESV" reservation
+         # (Device (PRRE), DSDT line 15370) that Windows uses.  Dortania's
+         # userspace-issues page prescribes SSDT-PMC for 300-series under
+         # "Stuck at N minutes remaining", which is NVRAM-write related; the
+         # installer writes NVRAM in its final phase.  The MMIO base was
+         # verified by decoding PRRE._CRS by hand rather than trusting the
+         # sample -- see the header of build/ACPI-src/SSDT-PMC.dsl.
+         #
+         # Deliberately NOT paired with NVRAM LegacyEnable/LegacyOverwrite
+         # (the emulated-NVRAM path Dortania lists for non-300-series): native
+         # NVRAM demonstrably works here -- the DEBUG log shows
+         # "OC: Setting ROM ... - Success" / "Setting MLB ... - Success" with
+         # WriteFlash=True -- so switching to nvram.plist would discard working
+         # functionality to paper over a missing ACPI device.
+         "SSDT-PMC.aml"]
 
 acpi_add = [{"Comment": f"{s}", "Enabled": True, "Path": s} for s in SSDTS]
 
