@@ -243,29 +243,73 @@ igpu = {
     #   "MLR: [COMM] ProbeMaxLinkRate() Failed to read supported link rates
     #    from DPCD."
     #
-    # 0x14 = HBR2, 5.4 Gbps/lane.  The panel is 1920x1080 @ 60 Hz 24-bit,
-    # ~3.2 Gbps of payload, so a single lane at this rate already covers it and
-    # link training negotiates down from here -- the value is a ceiling, not a
-    # demand.  Set explicitly instead of relying on WhateverGreen's internal
-    # default so the value is visible in the config.
+    # THE VALUE MATTERS -- IT IS NOT A HARMLESS CEILING.
     #
-    # CONFIRMED ON HARDWARE 2026-08-18.  With this pair added and -igfxblt kept,
+    # This was first set to 0x14 (HBR2, 5.4 Gbps/lane) on the reasoning that the
+    # rate is only an upper bound that link training negotiates down from.  That
+    # reasoning was wrong, and it cost us a second bug: with 0x14 the machine
+    # booted and ran fine, but the moment the display went to DPMS off it went
+    # black and never came back -- not dark-but-visible under a flashlight (so
+    # not a backlight fault), not recoverable with the brightness keys, and not
+    # recoverable by closing and reopening the lid.  The firmware brings the eDP
+    # link up at the panel's real rate before macOS starts, so the first screen
+    # is inherited and works; every subsequent re-enable retrains the link at
+    # whatever this property says, and a rate the sink cannot do fails training
+    # every time -- which is exactly why the lid trick never helped.
+    #
+    # The FAQ's own guidance is per-resolution, not "highest wins":
+    #   "Typically use 0x14 for 4K display and 0x0A for 1080p display.  All
+    #    possible values are 0x06 (RBR), 0x0A (HBR), 0x14 (HBR2), 0x1E (HBR3)."
+    #
+    # This panel is a Sharp LQ133M1JW41, 13.3" 1920x1080, decoded from the live
+    # EDID (ioreg AppleBacklightDisplay -> IODisplayEDID, descriptor string
+    # "LQ133M1JW41").  Sharp eDP panels are the family the FAQ singles out for
+    # this very fix ("Dell Inspiron 7590 with Sharp display").  0x0A is provably
+    # sufficient here, from that same EDID's detailed timing block:
+    #   pixel clock  = 0x361A = 13850 -> 138.50 MHz
+    #   payload      = 138.50 MHz * 24 bpp        = 3.324 Gbps
+    #   with 8b/10b  = 3.324 / 0.8                = 4.155 Gbps needed
+    #   2 lanes * 2.7 Gbps (HBR)                  = 5.400 Gbps available
+    #   headroom                                  = 1.30x
+    # and 0x0A is non-zero, so it cannot bring back the division-by-zero panic
+    # that this property exists to prevent.
+    #
+    # Do NOT "upgrade" this to 0x14 or 0x1E.  Higher is not safer here.
+    #
+    # Careful about reading the DPCD dump as confirmation either way: WEG's fix
+    # hooks the AUX read and GetDPCDInfo prints its dump afterwards, so
+    #   [DPCD_Info] DPCD DUMP: Fb=0
+    #    14 14 C2 41          <- 0x000 rev 1.4, 0x001 MAX_LINK_RATE, 0x002 lanes
+    # shows the value we injected, not the panel's native capability.  The
+    # panel's real maximum link rate has never been observed on this machine.
+    #
+    # If 0x0A still does not survive a display-sleep cycle, the next lever is to
+    # remove this property entirely and keep only the enable flag: WEG 1.4.4+
+    # probes a supported rate from the DPCD itself when no value is given, which
+    # is the FAQ's preferred configuration.  It is deliberately not the first
+    # thing tried, because a probe that returns something the driver rejects
+    # panics, and the rescue USB is currently unplugged.
+    #
+    # CONFIRMED ON HARDWARE 2026-08-18 that the PAIR fixes the panic (this was
+    # measured with 0x14; the panic fix comes from the divisor being non-zero,
+    # which 0x0A satisfies equally).  With this pair added and -igfxblt kept,
     # the machine booted to the desktop and stayed up with no panic, where the
     # identical config without them panicked ~30 s after EXITBS twice in a row.
     # VRAM went 7 MB -> 1536 MB, Metal 3 came up, and all three framebuffers
     # (internal eDP + 2x DP) enumerated -- i.e. nothing was traded away for the
-    # fix.  The kernel log now shows the divisor arriving as a sane value:
+    # fix.  The kernel log shows the divisor arriving as a sane value:
     #   (AppleIntelCFLGraphicsFramebuffer) [DPCD_Info] FB0: Display port config
     #     ver is 1.4
-    #   ... [DPCD_Info] FB0 Maximum link rate is 0x14
+    #   ... [DPCD_Info] FB0 Maximum link rate is 0x14   <- becomes 0x0A now
     #   ... [DPCD_Info] FB0: Maximum lanes is 2
-    # Note the log cannot distinguish WhateverGreen's injected 0x14 from a
-    # native read of 0x14, so this is evidence the divisor is no longer zero,
-    # not proof of which code path supplied it.  The causal link is still solid:
-    # -igfxblt alone panicked reproducibly, -igfxblt plus these two keys does
-    # not.  Do not drop them on the theory that the panel "reports 0x14 anyway".
+    # The causal link for the panic fix is solid: -igfxblt alone panicked
+    # reproducibly, -igfxblt plus these two keys does not.  Do not drop the pair.
+    #
+    # 0x0A NOT YET CONFIRMED on hardware -- deployed 2026-08-18, awaiting a
+    # display-sleep cycle.  Success criterion: the panel comes back by itself
+    # after `pmset displaysleepnow`.
     "enable-dpcd-max-link-rate-fix": D("01000000"),
-    "dpcd-max-link-rate":            D("14000000"),
+    "dpcd-max-link-rate":            D("0A000000"),
 }
 
 dev_props = {
