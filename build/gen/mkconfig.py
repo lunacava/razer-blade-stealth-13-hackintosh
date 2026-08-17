@@ -192,14 +192,74 @@ acpi_patch = [
 
 # ---------------------------------------------------------------- DeviceProperties
 # iGPU: Intel UHD 620 on Whiskey Lake, PCI 8086:3EA0 @ 00:02.0 -> PciRoot(0x0)/Pci(0x2,0x0)
-# ig-platform-id 00009B3E is the Dortania-recommended laptop framebuffer for
-# Coffee Lake Plus / Whiskey Lake. device-id is spoofed to 3E9B because Apple's
-# drivers ship no entry for 3EA0.
+# This CPU is an i7-8565U -- Whiskey Lake-U, UHD 620, real PCI id 8086:3EA0.
+# Apple ships no driver entry for 3EA0, so device-id must be spoofed.
+#
+# CHANGED 2026-08-18 from 0x3E9B0000 / device-id 0x3E9B to 0x3EA50009 / 0x3EA5.
+#
+# The old pair was carried here with a comment claiming 0x3E9B0000 was "the
+# Dortania-recommended laptop framebuffer for Coffee Lake Plus / Whiskey Lake".
+# That was wrong on both halves.  WhateverGreen's own FAQ.IntelHD is explicit:
+#   Recommended framebuffers:
+#     Desktop:  0x3EA50000 (default), 0x3E9B0007 (recommended)
+#     Laptop:   0x3EA50009 (default)
+#   "For UHD620 (Whiskey Lake) fake device-id A53E0000 for IGPU."
+# 0x3E9B0000 does appear in the CFL/CML list as "mobile" with 3 connectors, so
+# it is not a desktop layout -- but it is not the laptop default either, and
+# 0x3E9B is not the documented fake for Whiskey Lake.  We were running the
+# wrong half of two different recipes.
+#
+# WHY THIS MATTERS -- IT IS THE eDP LINK-TRAINING FAILURE.
+#
+# With 0x3E9B0000 the panel lights at boot and never comes back once the
+# display is powered off.  Full trace of one failed wake (07:17:02, log show on
+# AppleIntelCFLGraphicsFramebuffer) shows the driver doing everything right and
+# the sink refusing to lock:
+#   Panel power ON time was 228 ms          <- panel really is powered
+#   PP_STATUS=0x80000008
+#   SetupOptimalLaneCount: Optimal - LaneCount=2, BitRate=0xa
+#   SetupDPTimings: pixelClock=138500000, linkSymbolClock=270000000,
+#                   colorDepth=24, noLanes=2
+#   EnableClocks: PLL successfully enabled
+#   ConfigureBufferTranslation: BT: Using eDP eye
+#   [Link_Training] Config : ASREnabled 1 noLanes 2 bitRate a enhanced framing 1
+#   ... Clock Recovery Initated, Retry Count = 0    HW strength setting=0
+#       laneStatus=0   (request01=0,    ...) Voltage=0, Pre-Emphasis=0
+#   ... Clock Recovery Initated, Retry Count = 1    HW strength setting=0
+#       laneStatus=0   (request01=0x11, ...) Voltage=1, Pre-Emphasis=0
+#   ...                                            HW strength setting=0x4
+#       laneStatus=0   (request01=0x22, ...) Voltage=2, Pre-Emphasis=0
+#   ...                                            HW strength setting=0x87
+#       laneStatus=0   (request01=0x33, ...) Voltage=3, Pre-Emphasis=0
+#   ... four more retries, all laneStatus=0 at Voltage=3
+#   [WARNING] Failed Phase 1 of Link Training
+#   [ERROR  ] Link training failed - notifying AGDC to take display offline
+#   [ERROR  ] [Modeset] Not successful. Disabling display
+#
+# Every AUX transaction in that sequence returned Status:0, and the sink filled
+# in ADJUST_REQUEST (0x11 -> 0x22 -> 0x33) asking for more swing, so the panel
+# is powered, addressable and responding.  It simply never asserts CR_DONE:
+# laneStatus stays 0 through all four voltage levels and every retry.  That is
+# the signature of the wrong electrical/connector configuration for this port
+# -- ConfigureBufferTranslation picks its "eDP eye" values from the framebuffer
+# layout, so the layout choice is exactly what is being tested here -- not a
+# bandwidth problem (0x14 and 0x0A both fail identically) and not a backlight
+# problem (the panel shows nothing at all under a flashlight).
+#
+# It is consistent that boot works and only re-enable fails: the firmware
+# trains the link before macOS starts, so the first screen is inherited and
+# never re-trained.
+#
+# NOT YET CONFIRMED on hardware.  Success criterion: the panel returns by
+# itself after `pmset displaysleepnow`.  If 0x3EA50009 does not fix it, the
+# remaining honest options are 0x3E920009 / 0x3E9B0009 (the other two 3-connector
+# mobile layouts) and, failing all of them, never letting the link drop
+# (display sleep and lid sleep disabled) -- see docs/hardware-findings.md.
 igpu = {
-    "AAPL,ig-platform-id":      D("00009B3E"),
-    "device-id":                D("9B3E0000"),
+    "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
+    "device-id":                D("A53E0000"),   # 0x3EA5, WHL fake per FAQ
     "framebuffer-patch-enable": D("01000000"),
-    # The 0x3E9B0000 framebuffer wants 57 MB stolen (58 MB total) but this
+    # The framebuffer wants 57 MB stolen (58 MB total) but this
     # BIOS pre-allocates only 32 MB DVMT and exposes no setting to raise it
     # (verified: registry HardwareInformation.MemorySize, and no DVMT item in
     # BIOS 1.01).  WhateverGreen's manual is explicit that without the
@@ -211,11 +271,12 @@ igpu = {
     # avoid flashing, since BIOS 3.02 is known to brick this model.)
     "framebuffer-stolenmem":    D("00003001"),
     "framebuffer-fbmem":        D("00009000"),
-    # No connector-type patch: 0x3E9B0000 already ships [0] LVDS + [1] DP +
-    # [2] DP (type 0x00000400 -> 00040000 LE), which matches this machine
-    # exactly -- internal eDP panel plus USB-C and Thunderbolt 3, no HDMI.
-    # Forcing con1/con2 to DP would be a no-op, so it is omitted rather than
-    # carried as dead config.
+    # No connector-type patch.  0x3EA50009 is a 3-connector mobile layout
+    # ([0] internal panel + [1] DP + [2] DP), which matches this machine
+    # exactly -- internal eDP panel plus USB-C and Thunderbolt 3, no HDMI --
+    # so forcing con1/con2 to DP would be a no-op and is omitted rather than
+    # carried as dead config.  Re-check this after the switch: the previous
+    # layout enumerated 3 framebuffers on hardware, and the new one must too.
     #
     # DPCD maximum-link-rate fix.  Without this, enabling acceleration panics
     # the machine the instant WindowServer programs the internal panel:
