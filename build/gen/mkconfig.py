@@ -464,7 +464,55 @@ config = {
             #               alternative fix (-igfxblt, WEG >= 1.6.5) is the
             #               correct one here and -igfxblr must NOT be used.
             #               Guards against the 3-minute black screen on boot.
-            "boot-args": "-v debug=0x100 keepsyms=1 alcid=30 -igfxblt",
+            # -btlfxboardid BlueToolFixup board-id patch.  Without it Bluetooth
+            #               never initialises at all: bluetoothd picks its HCI
+            #               transport from the SMBIOS board-id, and we present
+            #               Mac-827FB448E656EC26 (MacBookPro15,2), a T2 machine
+            #               whose Bluetooth hangs off UART behind the T2.  So it
+            #               waits for a serial port that does not exist here and
+            #               respawns every ~16 s forever:
+            #                 FindTransportType -- UART Transport
+            #                 HCI Transport is set to H4BC
+            #                 UART open(/dev/cu.BLTH) port failed to appear
+            #                   after 15 seconds (Operation timed out)
+            #                 Bluetooth error - restarting { reason=1201,
+            #                   context="Transport layer initialization failed" }
+            #               This machine's Bluetooth is Intel 8087:0aaa on USB.
+            #
+            #               Why a boot-arg is REQUIRED on Sonoma specifically --
+            #               from BlueToolFixup.cpp (BrcmPatchRAM, read at
+            #               REL-272-2026-03-20, matching the shipped 2.7.2):
+            #                 if (getKernelVersion() >= KernelVersion::Sonoma) {
+            #                     shouldPatchBoardId =
+            #                         checkKernelArgument("-btlfxboardid");
+            #                 } else {
+            #                     ... auto-detect via boardIdsWithUSBBluetooth
+            #                 }
+            #               i.e. up to Ventura the kext decided by itself, but on
+            #               Sonoma+ the board-id patch is opt-in and does nothing
+            #               unless this boot-arg is present.  That is why having
+            #               BlueToolFixup.kext loaded was not enough.
+            #
+            #               What it does: patches the in-memory pages of
+            #               /usr/sbin/bluetoothd and /usr/sbin/BlueTool, finding
+            #               boardIdsWithUSBBluetooth[0] ("Mac-F60DEB81FF30ACF6",
+            #               Mac Pro 6,1) and substituting our own board-id, so
+            #               FindTransportType resolves to USB.  Both strings are
+            #               20 bytes, so the substitution is size-compatible, and
+            #               the search target was confirmed present in the
+            #               shipped binaries (1x in bluetoothd, 2x in BlueTool).
+            #
+            #               NOT YET CONFIRMED WORKING on this machine.  One thing
+            #               argues for caution: our board-id already appears in
+            #               bluetoothd's own 43-entry board-id table, so that
+            #               table is several sub-lists and we are presumably in
+            #               the UART one.  Whether the patched USB entry wins
+            #               depends on evaluation order, which was not read out
+            #               of the binary.  If Bluetooth still does not come up,
+            #               the next lever is a non-T2 SMBIOS -- but that changes
+            #               the serial and MLB, so it needs a decision about
+            #               re-verifying the Apple ID already signed in here.
+            "boot-args": "-v debug=0x100 keepsyms=1 alcid=30 -igfxblt -btlfxboardid",
             "csr-active-config": D("00000000"),
             "prev-lang:kbd": D("656E2D55533A30"),   # en-US:0
             "run-efi-updater": "No",
