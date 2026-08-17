@@ -250,9 +250,67 @@ acpi_patch = [
 # trains the link before macOS starts, so the first screen is inherited and
 # never re-trained.
 #
-# CONFIRMED FIXED on hardware, 2026-08-18 07:35-07:37, four consecutive
-# `pmset displaysleepnow` -> wake cycles.  The same log range that produced the
-# failure trace above now reads:
+# BIG IMPROVEMENT, BUT NOT A COMPLETE FIX.  READ THE WHOLE NOTE BEFORE
+# TRUSTING THIS.
+#
+# An earlier revision of this comment said "CONFIRMED FIXED on hardware,
+# 2026-08-18 07:35-07:37, four consecutive `pmset displaysleepnow` -> wake
+# cycles".  That claim was too strong, and the reason is instructive: all four
+# of those cycles left the panel off for only ~14 seconds.  A later controlled
+# experiment varied nothing but that duration:
+#     TEST A -- display off  15 s -> laneStatus=0x77            SUCCESS
+#     TEST B -- display off 180 s -> "Failed to fast link train",
+#                                     laneStatus=0x7            BLACK SCREEN
+# Both tests ran with system sleep disabled (`pmset -a sleep 0`), so S3 was not
+# involved in either.  (An intermediate diagnosis blamed S3; that was a grep
+# artifact -- the predicate `eventMessage CONTAINS "Entering Sleep state"`
+# matched `log show`'s own command line being logged.  There was no S3.)
+#
+# So the governing variable is HOW LONG THE PANEL STAYS OFF, not whether the
+# machine suspended.  Long-off resumes fail; short-off resumes succeed.
+#
+# The driver-side defect is visible in one line:
+#     [LINK_TRAINING] Failed to fast link train, err = 0x0
+# It DETECTS that fast link training failed and then does not fall back to full
+# link training -- it proceeds straight to EnablePipe with a partially trained
+# link.  That is why "Failed Phase 1 of Link Training" never appears in this
+# failure mode: full training is never attempted.
+#
+# The partial lock is per-lane and random:
+#     laneStatus=0x77  both lanes locked          -> picture
+#     laneStatus=0x07  lane0 only (0x01|0x02|0x04) -> black
+#     laneStatus=0x70  lane1 only (0x10|0x20|0x40) -> black
+# One lane at HBR carries 2.7 Gbps, and this panel needs 4.155 Gbps, so a
+# one-lane link cannot display anything.  Because it is random, RETRYING
+# RECOVERS: an observed sequence was 0x7 -> 0x7 -> 0x77, i.e. the third
+# `pmset displaysleepnow` + wake brought the picture back.  That is the
+# emergency procedure over SSH when the panel is dark.
+#
+# What the layout change genuinely bought, measured, is still large.  Before it
+# the panel was unrecoverable: 8 clock-recovery retries, drive strength escalated
+# to voltage=3 / 0x87, and laneStatus=0 every single time, ending in "Link
+# training failed - notifying AGDC to take display offline" / "[Modeset] Not
+# successful. Disabling display".  After it, short-off resumes always work and
+# long-off resumes are recoverable by retry.  The remaining bug is a missing
+# fallback path, not a dead link.
+#
+# CURRENT MITIGATION IN PLACE ON THE MACHINE (not config): display sleep is
+# suppressed entirely with `caffeinate -d -i` held by launchd
+# (`launchctl submit -l caffeinate.hold -- /usr/bin/caffeinate -d -i`), plus
+# `pmset -a sleep 0`.  Lid-close sleep is NOT covered by caffeinate.
+#
+# NEXT LEVER TO INVESTIGATE: the resume log shows
+#     Using the default EDP panel timings
+#     Override power up delays to optimize
+# The driver shortens the panel power-up delay.  A panel that has been off for
+# seconds is still warm and trains fine; one off for minutes is cold and needs
+# the full T3/T7 delay before AUX/lane training is reliable.  That hypothesis
+# fits the duration dependence exactly and has not yet been tested.
+# WhateverGreen exposes no knob for this: FAQ.IntelHD never mentions fast link
+# training, no `-igfx*` boot-arg covers it, and DPCDMaxLinkRateFix's ReadAUX
+# hook rewrites only MAX_LINK_RATE (DPCD 0x001).
+#
+# The measurement that produced the original (short-cycle) success reads:
 #     [Modeset] FB0: Complete modeset
 #     [Modeset] Lighting up eDP
 #     IG:: EnableClocks:12937 PLL successfully enabled
@@ -274,17 +332,19 @@ acpi_patch = [
 #     merely tolerable.
 #   * "Failed Phase 1 of Link Training", "Link training failed - notifying
 #     AGDC to take display offline" and "[Modeset] Not successful. Disabling
-#     display" are all absent -- zero occurrences for the whole boot.
+#     display" are all absent -- zero occurrences for that whole boot.  Note
+#     that their absence is necessary but NOT sufficient: the long-off failure
+#     mode above also produces none of them, because it fails in fast link
+#     training and never reaches full training.  Always check laneStatus.
 #   * BitRate = 10 is decimal for the injected 0x0A, so the DPCD property below
 #     is being honoured at the same time.
 # Acceleration survived the switch: Device ID 0x3ea5, VRAM 1536 MB, Metal 3,
 # 3 framebuffers enumerated, display Online / Main Display Yes, no new panics.
 #
-# Kept for the record, in case a future macOS regresses this: the remaining
-# candidate layouts were 0x3E920009 / 0x3E9B0009 (the other two 3-connector
-# mobile layouts), and the last-resort workaround was never letting the link
-# drop at all (display sleep and lid sleep disabled).  Neither was needed.
-# See docs/hardware-findings.md.
+# Still-open alternatives, since the fix is incomplete: the other two
+# 3-connector mobile layouts 0x3E920009 / 0x3E9B0009 are untried, and the
+# last-resort workaround -- never letting the link drop at all -- is what is
+# actually deployed right now via caffeinate.  See docs/hardware-findings.md.
 igpu = {
     "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
     "device-id":                D("A53E0000"),   # 0x3EA5, WHL fake per FAQ

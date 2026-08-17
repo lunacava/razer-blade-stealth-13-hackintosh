@@ -942,7 +942,11 @@ WhateverGreen `FAQ.IntelHD` の記載:
 
 ### 修正と確認（`0x3EA50009` + `device-id 0xA53E0000`）
 
-`pmset displaysleepnow` → wake を 4回連続、全部成功:
+> **大幅改善だが完全修復ではない。この節は必ず次の「時間依存性」節まで読むこと。**
+> この節は当初「4/4 で成功、CONFIRMED FIXED」と書いていたが、その4サイクルは
+> すべて消灯時間 **約14秒**だった。消灯時間を変えるだけで結果が反転する。
+
+`pmset displaysleepnow` → wake を 4回連続、全部成功（いずれも消灯 14 秒）:
 
 ```
 [Modeset] FB0: Complete modeset
@@ -963,6 +967,95 @@ IG:: EnableClocks:12937 PLL successfully enabled
   この起動で **0件**。
 - アクセラレーションは無傷: Device ID `0x3ea5`、VRAM 1536MB、Metal 3、
   framebuffer 3個、Online: Yes、新規パニックなし。
+
+### 真の支配変数は「消灯していた時間」だった
+
+システムスリープを無効化した状態（`pmset -a sleep 0`）で、消灯時間だけを変えた対照実験:
+
+| テスト | 消灯時間 | 結果 |
+|---|---|---|
+| A | 15 秒 | `laneStatus=0x77` **成功** |
+| B | 180 秒 | `Failed to fast link train` / `laneStatus=0x7` **黒画面** |
+
+S3 は両方とも介在していない。**途中で「原因は S3 だ」と診断したのは誤りで、
+その根拠は私のグレップの誤検出だった** — 述語
+`eventMessage CONTAINS "Entering Sleep state"` が、`log show` 自身のコマンドラインが
+ログに載ったものにマッチしていた。S3 は起きていない。
+
+つまりホットコーナーで踏んだ黒画面も、S3 のせいではなく**2分放置したから**である。
+
+#### ドライバ側の欠陥: フォールバックが無い
+
+```
+[LINK_TRAINING] Failed to fast link train, err = 0x0
+```
+
+ドライバは fast link training の失敗を**検出しているのに、フルリンクトレーニングに
+落ちない**。そのまま部分的にしか張れていないリンクで `EnablePipe` に進む。
+だからこの失敗モードでは `Failed Phase 1 of Link Training` が出ない
+（フルトレーニングが一度も試行されないため）。
+
+**`Failed Phase 1` が無いことは成功の証拠にならない。必ず `laneStatus` を見ること。**
+
+#### 部分ロックはレーン単位でランダム
+
+| `laneStatus` | 意味 | 画面 |
+|---|---|---|
+| `0x77` | 両レーンロック | 出る |
+| `0x07` | lane0 のみ (`0x01|0x02|0x04`) | 黒 |
+| `0x70` | lane1 のみ (`0x10|0x20|0x40`) | 黒 |
+
+1レーン HBR = 2.7 Gbps では必要な 4.155 Gbps に足りないので、片側だけでは何も映らない。
+
+**ランダムなので、リトライすれば復帰する。** 実測で `0x7` → `0x7` → `0x77` と推移し、
+3回目の `pmset displaysleepnow` + wake で画面が戻った。**これが SSH 越しの緊急復帰手順**:
+
+```bash
+for n in 1 2 3 4 5; do
+  T=$(date '+%Y-%m-%d %H:%M:%S')
+  pmset displaysleepnow; sleep 4; caffeinate -u -t 10 & sleep 10
+  r=$(log show --start "$T" --predicate 'senderImagePath CONTAINS "AppleIntelCFLGraphicsFramebuffer"' \
+      --style compact 2>/dev/null | grep -oE 'laneStatus=0x[0-9a-f]+' | tail -1)
+  echo "retry $n: $r"; [ "$r" = "laneStatus=0x77" ] && break
+done
+```
+
+#### それでもレイアウト変更の効果は大きい
+
+変更前は**復帰不能**だった: 8回のクロックリカバリ試行、ドライブ強度を
+voltage=3 / 0x87 まで escalate、それでも毎回 `laneStatus=0`、最後は
+`Link training failed - notifying AGDC to take display offline` /
+`[Modeset] Not successful. Disabling display`。
+
+変更後は短時間消灯なら確実に復帰し、長時間消灯もリトライで復帰する。
+残っているのは**フォールバック経路の欠落**であって、リンクが死んでいるのではない。
+
+#### 現在の実機側の回避策（config ではなくランタイム）
+
+```bash
+pmset -a sleep 0                                                    # S3 を無効化（要 sudo）
+launchctl submit -l caffeinate.hold -- /usr/bin/caffeinate -d -i     # ディスプレイスリープ自体を抑止
+```
+
+`caffeinate` は launchd 経由なので SSH 切断後も生き残る。
+**蓋閉じスリープは `caffeinate` では抑止できない。**
+
+#### 次に調べる仮説: パネル電源投入遅延
+
+復帰時のログにこれが出ている:
+
+```
+Using the default EDP panel timings
+Override power up delays to optimize
+```
+
+ドライバがパネル電源投入後の待ち時間を**短縮**している。数秒消えていただけのパネルは
+まだ温まっているので短縮でも間に合うが、数分消えていた冷えたパネルは
+本来の T3/T7 遅延が必要 — これは観測された時間依存性を正確に説明する。**未検証**。
+
+WhateverGreen にこれを操作する手段は無い（`FAQ.IntelHD` に `fast link` の記述なし、
+`-igfx*` boot-arg にも該当なし、`DPCDMaxLinkRateFix` の `ReadAUX` フックが
+書き換えるのは MAX_LINK_RATE (DPCD 0x001) のみ — ソースで確認済み）。
 
 ### 副産物: `dpcd-max-link-rate` の値は「無害な上限」ではない
 
@@ -1007,3 +1100,95 @@ WEG が AUX 読み出しをフックした後に `GetDPCDInfo` がダンプを�
 入れたが、そのパニックの診断は間違ったレイアウトのまま行われたので、
 同じ根本原因の別症状だった可能性がある。外して試す価値はあるが、
 失敗モードが起動パニックなので、他の変更と混ぜず、revert スクリプトを用意して単独で行う。
+
+## ★ 発見 11: 内蔵カメラは動作している（2026-08-18 確認）
+
+Reddit 報告では未確認扱いだった内蔵 Web カメラを、実機ログで確認した。
+
+### 認識状態
+
+```
+system_profiler SPCameraDataType:
+  Integrated Camera:
+    Model ID: UVC Camera VendorID_5075 ProductID_22229    (0x13D3:0x56D5, IMC Networks)
+    Unique ID: 0x1440000013d356d5
+
+ioreg -p IOUSB:
+  +-o Integrated Camera@14400000  <class AppleUSBDevice, registered, matched, active>
+```
+
+追加 kext は不要。Apple 標準の `UVCAssistant`（CoreMediaIO system extension）＋
+`VDCAssistant` がそのまま担当する。
+
+### ストリーミング実測（Photo Booth を SSH から起動して計測）
+
+```
+UVCUSBDeviceStreamingInterface  format: UVCDeviceStreamFormat:[1280 * 720 (MJPEG)]
+                                frameInterval : 333333            (= 30.0 fps)
+Last Stream  StartTime: 08:42:42.497   StopTime: 08:45:53.628
+FirstPacketTime:        08:42:42.645   (開始 +148 ms)
+FirstFrameDispatchTime: 08:42:42.814   (開始 +317 ms)
+TotalPackets: 1527768   TotalFrames: 5768
+```
+
+- **3分11秒で 5,768 フレーム = 30.2 fps**、公称 30 fps とほぼ一致。実質ドロップなし
+- 1280×720 MJPEG。USB のアイソクロナス転送が正常に成立している
+- 最初のフレームが 317 ms で到達 → 初期化も正常
+- メニューバーにカメラ使用中インジケータ（緑）が点灯
+
+停止時に出る
+
+```
+(IOUSBHostFamily) UVCAssistant@14400000: AppleUSBHostFrameworkInterfaceClient::
+  hostPipeClearStall: unable to get pipe with endpoint address 129
+```
+
+は、既に破棄済みの IN エンドポイント (0x81) に対する後片付けメッセージで**無害**。
+
+### 未確認として残る点
+
+**絵の中身（真っ黒でないか）は未確認。** MJPEG は真っ黒な被写体でもフレームを配送するので、
+30 fps 安定配送だけでは中身を保証しない。目視、または後述の画面収録許可が必要。
+
+なお USB ポートマッピング（USBToolBox）は**まだ実施していない**。それでもカメラの
+アイソクロナス転送が 30 fps で成立しているので、少なくともこのポートの
+記述は実用上問題ない。
+
+## ★ 発見 12: SSH 越しの `screencapture` はウィンドウを無言で剥がす
+
+SSH 経由で `screencapture -x` を実行すると **exit 0 で成功し、正常な PNG が生成される**。
+しかしその画像には**壁紙とメニューバーしか写らない** — ウィンドウも Dock も
+一切含まれない。エラーも警告も出ない。
+
+### 判定の根拠
+
+- Dock プロセス（PID 367）が稼働しているのに、全キャプチャで Dock が写らない
+- Photo Booth の保存ウィンドウ位置は `"NSWindow Frame Main Window" = "556 252 720 568 0 0 1920 1055"`
+  = 完全に画面内なのに写らない
+- ディスプレイは1台のみ（`screencapture -x a.png b.png c.png` で 2枚目以降は生成されず、
+  `system_profiler` も `Connection Type: Internal` の1台のみ）。ゴーストディスプレイ説は否定
+- 連続2回のキャプチャがバイト単位で同一サイズ（3917842）→ 画面内容が変化していない
+
+### TCC の判定（`log show --predicate 'process == "tccd"'`）
+
+```
+kTCCServiceScreenCapture
+responsible = com.apple.sshd-keygen-wrapper  (/usr/libexec/sshd-keygen-wrapper)
+requesting  = com.apple.screencapture        (/usr/sbin/screencapture)
+arbiter     = com.apple.WindowServer
+```
+
+権限は **`sshd-keygen-wrapper` に帰属**する。これが「画面収録」の許可リストに
+無いため、WindowServer がウィンドウ内容を伏せる。
+
+### 対処
+
+フルスクリーンを取得したい場合は、システム設定 →
+プライバシーとセキュリティ → 画面収録 に **`/usr/libexec/sshd-keygen-wrapper`** を追加する
+（ファイル選択ダイアログで `Cmd+Shift+G` を使ってパスを直接入力。管理者権限が必要）。
+TCC.db は SIP 保護下なので、リモートから `sudo` 無しでは変更できない。
+
+**教訓: このプロジェクトで「画面が正常か」を screencapture で判断してはいけない。**
+黒画面バグの最中でもフレームバッファの中身は正常に撮れてしまうし、
+逆にウィンドウが写らないのはアプリの異常ではない。
+リンクトレーニングの成否は `laneStatus` で、カメラの成否は UVC のフレーム数で見る。
