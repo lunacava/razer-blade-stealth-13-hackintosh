@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------- secrets
+# Per-machine SMBIOS identity.  Never commit: a shared serial/MLB causes
+# Apple-side collisions that break iMessage/FaceTime on BOTH machines.
+build/gen/smbios.local.py
+# SSH host/user for the target laptop.
+bin/rz.env.local
+
+# ---------------------------------------------------------------- user data
+# 3.7 GB image of the user's USB stick, including personal credential files.
+backup/
+
+# ---------------------------------------------------------------- 3rd-party binaries
+# Official acidanthera / USBToolBox release archives and their extractions.
+# Re-download from the upstream GitHub releases; see docs/install-runbook.md
+# for the exact versions and SHA-256 hashes.
+downloads/
+download/
+
+# ---------------------------------------------------------------- build output
+# Assembled EFI trees (~2.2 GB across variants).  Reproducible from
+# build/gen/mkconfig.py + build/ACPI-src/ + upstream kexts.
+build/EFI/
+build/EFI-*/
+build/usb/
+build/unused-kexts/
+
+# ---------------------------------------------------------------- misc
+.DS_Store
+._*
+__pycache__/
+*.pyc
+
+# Orphaned fragment of a third-party kext bundle (IntelBluetoothInjector).
+unused-kexts/

@@ -1,0 +1,29 @@
+"""
+Template for smbios.local.py -- copy this file to smbios.local.py and fill in
+values generated for YOUR machine:
+
+    cp smbios.local.py.example smbios.local.py
+
+Why this is not committed:  these four values are the identity macOS presents
+to Apple ("which Mac am I").  If two machines present the same SystemSerialNumber
+and MLB, Apple can flag both, and iMessage / FaceTime / App Store sign-in break
+on each of them.  Never reuse a set you found on the internet -- including any
+set that may appear in this repository's history.
+
+How to generate:
+
+  1. Get GenSMBIOS from https://github.com/corpnewt/GenSMBIOS
+  2. Run it, choose "Generate SMBIOS", and enter:  MacBookPro15,2
+     (see the SMBIOS comment in mkconfig.py for why 15,2 specifically)
+  3. Copy the Serial and Board Serial (MLB) it prints below.
+  4. SystemUUID: any random UUID.  `uuidgen` on macOS/Linux.
+  5. ROM: 6 bytes as 12 hex characters.  Convention is your real built-in
+     Ethernet/Wi-Fi MAC address with the colons removed, e.g. a MAC of
+     00:11:22:aa:bb:cc becomes "001122AABBCC".  Any stable 12 hex chars work.
+
+Do not add the values to this .example file -- put them in smbios.local.py.
+"""
+SystemSerialNumber = "PUT-YOUR-SERIAL-HERE"      # e.g. "C02XXXXXXXXX"
+MLB                = "PUT-YOUR-MLB-HERE"         # e.g. "C02XXXXXXXXXXXXXX"
+SystemUUID         = "PUT-YOUR-UUID-HERE"        # e.g. `uuidgen` output
+ROM                = "PUTYOURROMHERE"            # 12 hex chars, no separators

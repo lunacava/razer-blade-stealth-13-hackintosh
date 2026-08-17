@@ -1,0 +1,34 @@
+#!/bin/bash
+# Run a PowerShell command on the Razer (Windows side) over SSH, UTF-8 clean.
+#
+# PowerShell is read from stdin, e.g.:
+#     cat <<'EOF' | ./bin/rzps
+#     Get-FileHash C:\path\to\file -Algorithm SHA256 | Format-List
+#     EOF
+#
+# Note: $ErrorActionPreference is deliberately "Continue", not "Stop" -- with
+# "Stop", inline if() expressions in a piped-in script abort the whole command.
+#
+# Connection details come from bin/rz.env.local (not committed).  Copy
+# bin/rz.env.local.example to bin/rz.env.local and edit, or override per-call:
+#     RZ_HOST=192.168.0.5 ./bin/rzps
+set -euo pipefail
+
+_env="$(dirname "$0")/rz.env.local"
+# shellcheck disable=SC1090
+[ -f "$_env" ] && . "$_env"
+
+RZ_USER="${RZ_USER:-}"
+RZ_HOST="${RZ_HOST:-}"
+RZ_KEY="${RZ_KEY:-$HOME/.ssh/razer_hackintosh}"
+
+if [ -z "$RZ_USER" ] || [ -z "$RZ_HOST" ]; then
+  echo "rzps: set RZ_USER and RZ_HOST (see bin/rz.env.local.example)" >&2
+  exit 2
+fi
+
+CMD="$(cat)"
+PRE='[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference="SilentlyContinue"; $ErrorActionPreference="Continue";'
+B64=$(printf '%s %s' "$PRE" "$CMD" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
+ssh -i "$RZ_KEY" "$RZ_USER@$RZ_HOST" \
+  "powershell -NoProfile -NonInteractive -EncodedCommand $B64" 2>/dev/null

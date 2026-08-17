@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NAT</key>
+	<dict>
+		<key>AirPort</key>
+		<dict>
+			<key>40BitEncrypt</key>
+			<integer>1</integer>
+			<key>Channel</key>
+			<integer>0</integer>
+			<key>Enabled</key>
+			<integer>0</integer>
+			<key>NetworkName</key>
+			<string>MacMini</string>
+			<key>NetworkPassword</key>
+			<data>
+			</data>
+		</dict>
+		<key>Enabled</key>
+		<integer>0</integer>
+		<key>NatPortMapDisabled</key>
+		<false/>
+		<key>PrimaryInterface</key>
+		<dict>
+			<key>Device</key>
+			<string>en8</string>
+			<key>Enabled</key>
+			<integer>0</integer>
+			<key>HardwareKey</key>
+			<string></string>
+			<key>PrimaryUserReadable</key>
+			<string>USB 10/100/1000 LAN</string>
+		</dict>
+		<key>PrimaryService</key>
+		<string>8F23B5A2-A16C-484C-A913-2E74EB49C783</string>
+		<key>SharingDevices</key>
+		<array/>
+	</dict>
+</dict>
+</plist>

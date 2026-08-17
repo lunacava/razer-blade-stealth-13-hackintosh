@@ -1,0 +1,79 @@
+#!/bin/bash
+# Write the OpenCore + Sonoma recovery payload to a USB stick.
+#
+# Usage: bin/mkusb            -> list candidate disks and stop
+#        bin/mkusb disk7      -> format disk7 and write the payload
+#
+# The stick ends up as a single FAT32 partition holding:
+#   /EFI/{BOOT,OC}                   OpenCore, its kexts, SSDTs and config
+#   /com.apple.recovery.boot/*       Apple's Sonoma recovery image
+# That layout is what OpenCore's picker looks for -- no bless, no HFS+.
+set -euo pipefail
+
+PAYLOAD="$(cd "$(dirname "$0")/../build/usb" && pwd)"
+LABEL="OPENCORE"
+
+if [ ! -d "$PAYLOAD/EFI" ] || [ ! -d "$PAYLOAD/com.apple.recovery.boot" ]; then
+    echo "error: payload incomplete under $PAYLOAD" >&2
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    echo "Removable disks:"
+    echo
+    diskutil list physical | awk '
+        /^\/dev\/disk/ { dev = $1 }
+        /(external|removable)/ { print "  " dev "  " $0 }
+    '
+    echo
+    echo "Nothing written. Re-run with the identifier, e.g.:  $0 disk7"
+    exit 0
+fi
+
+DISK="${1#/dev/}"
+DEV="/dev/$DISK"
+
+# Refuse anything that is not external -- the internal drive must never be a target.
+if ! diskutil info "$DISK" | grep -q "Device Location:.*External"; then
+    echo "error: $DISK is not an external device. Refusing." >&2
+    diskutil info "$DISK" | grep -E "Device / Media Name|Device Location|Disk Size" >&2
+    exit 1
+fi
+
+echo "Target: $DEV"
+diskutil info "$DISK" | grep -E "Device / Media Name|Disk Size|Device Location"
+echo
+echo "This ERASES the entire disk. Type ERASE to continue:"
+read -r reply
+[ "$reply" = "ERASE" ] || { echo "aborted"; exit 1; }
+
+diskutil unmountDisk "$DEV" || true
+# MBR, not GPT: some firmwares only scan the first FAT partition of an MBR stick.
+diskutil eraseDisk MS-DOS "$LABEL" MBR "$DEV"
+
+MNT="/Volumes/$LABEL"
+for _ in $(seq 1 20); do [ -d "$MNT" ] && break; sleep 1; done
+[ -d "$MNT" ] || { echo "error: $MNT never appeared" >&2; exit 1; }
+
+echo "Copying payload..."
+cp -R "$PAYLOAD/EFI" "$MNT/"
+cp -R "$PAYLOAD/com.apple.recovery.boot" "$MNT/"
+
+# Strip the resource forks and .DS_Store that macOS scatters over FAT volumes;
+# OpenCore reads the directory verbatim and stray files clutter the picker.
+find "$MNT" -name '._*' -delete 2>/dev/null || true
+find "$MNT" -name '.DS_Store' -delete 2>/dev/null || true
+
+sync
+echo
+echo "Written:"
+du -sh "$MNT/EFI" "$MNT/com.apple.recovery.boot"
+df -h "$MNT" | tail -1
+echo
+echo "Verifying required files:"
+for f in EFI/BOOT/BOOTx64.efi EFI/OC/OpenCore.efi EFI/OC/config.plist \
+         com.apple.recovery.boot/BaseSystem.dmg com.apple.recovery.boot/BaseSystem.chunklist; do
+    if [ -e "$MNT/$f" ]; then echo "  ok   $f"; else echo "  MISSING  $f"; fi
+done
+echo
+diskutil eject "$DEV" && echo "Ejected. Safe to remove."

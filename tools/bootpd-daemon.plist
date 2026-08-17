@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>local.razer.bootpd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/libexec/bootpd</string>
+    <string>-d</string>          <!-- stay in foreground, do not daemonize -->
+    <string>-D</string>          <!-- DHCP server mode -->
+    <string>-i</string><string>en8</string>
+  </array>
+  <key>RunAtLoad</key>        <true/>
+  <key>KeepAlive</key>        <true/>
+  <key>StandardOutPath</key>  <string>/tmp/razer-bootpd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/razer-bootpd.log</string>
+</dict>
+</plist>
