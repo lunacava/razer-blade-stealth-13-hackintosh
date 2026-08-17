@@ -250,11 +250,41 @@ acpi_patch = [
 # trains the link before macOS starts, so the first screen is inherited and
 # never re-trained.
 #
-# NOT YET CONFIRMED on hardware.  Success criterion: the panel returns by
-# itself after `pmset displaysleepnow`.  If 0x3EA50009 does not fix it, the
-# remaining honest options are 0x3E920009 / 0x3E9B0009 (the other two 3-connector
-# mobile layouts) and, failing all of them, never letting the link drop
-# (display sleep and lid sleep disabled) -- see docs/hardware-findings.md.
+# CONFIRMED FIXED on hardware, 2026-08-18 07:35-07:37, four consecutive
+# `pmset displaysleepnow` -> wake cycles.  The same log range that produced the
+# failure trace above now reads:
+#     [Modeset] FB0: Complete modeset
+#     [Modeset] Lighting up eDP
+#     IG:: EnableClocks:12937 PLL successfully enabled
+#     [LINK_TRAINING] Running fast link training
+#     [LINK_TRAINING] noLanes=2, ASR=1, downspread=0 BitRate = 10
+#     [LINK_TRAINING] voltage=0, preEmphasis=0
+#     [LINK_TRAINING] laneMask=0xff, laneStatus=0x77
+# Every difference matters:
+#   * "fast link training", not "regular Link Training" -- the driver now
+#     trusts the cached link parameters instead of renegotiating from scratch,
+#     which is the correct eDP path.
+#   * laneStatus=0x77, not 0.  0x77 is CR_DONE|CHANNEL_EQ_DONE|SYMBOL_LOCKED
+#     set for lane0 (0x01|0x02|0x04) and lane1 (0x10|0x20|0x40) -- a fully
+#     locked 2-lane link.
+#   * voltage=0, preEmphasis=0 on the FIRST attempt, no retries.  Previously
+#     the driver escalated to voltage=3 / HW strength 0x87 across 8 attempts
+#     and still got laneStatus=0.  Succeeding at the lowest drive strength
+#     means the eDP eye parameters from this layout are the right ones, not
+#     merely tolerable.
+#   * "Failed Phase 1 of Link Training", "Link training failed - notifying
+#     AGDC to take display offline" and "[Modeset] Not successful. Disabling
+#     display" are all absent -- zero occurrences for the whole boot.
+#   * BitRate = 10 is decimal for the injected 0x0A, so the DPCD property below
+#     is being honoured at the same time.
+# Acceleration survived the switch: Device ID 0x3ea5, VRAM 1536 MB, Metal 3,
+# 3 framebuffers enumerated, display Online / Main Display Yes, no new panics.
+#
+# Kept for the record, in case a future macOS regresses this: the remaining
+# candidate layouts were 0x3E920009 / 0x3E9B0009 (the other two 3-connector
+# mobile layouts), and the last-resort workaround was never letting the link
+# drop at all (display sleep and lid sleep disabled).  Neither was needed.
+# See docs/hardware-findings.md.
 igpu = {
     "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
     "device-id":                D("A53E0000"),   # 0x3EA5, WHL fake per FAQ
@@ -275,8 +305,9 @@ igpu = {
     # ([0] internal panel + [1] DP + [2] DP), which matches this machine
     # exactly -- internal eDP panel plus USB-C and Thunderbolt 3, no HDMI --
     # so forcing con1/con2 to DP would be a no-op and is omitted rather than
-    # carried as dead config.  Re-check this after the switch: the previous
-    # layout enumerated 3 framebuffers on hardware, and the new one must too.
+    # carried as dead config.  Re-checked after the switch, 2026-08-18:
+    # ioreg -c AppleIntelFramebuffer still counts 3, so the new layout
+    # enumerates the same number of connectors as the old one.
     #
     # DPCD maximum-link-rate fix.  Without this, enabling acceleration panics
     # the machine the instant WindowServer programs the internal panel:
@@ -366,9 +397,29 @@ igpu = {
     # The causal link for the panic fix is solid: -igfxblt alone panicked
     # reproducibly, -igfxblt plus these two keys does not.  Do not drop the pair.
     #
-    # 0x0A NOT YET CONFIRMED on hardware -- deployed 2026-08-18, awaiting a
-    # display-sleep cycle.  Success criterion: the panel comes back by itself
-    # after `pmset displaysleepnow`.
+    # 0x0A CONFIRMED WORKING on hardware, 2026-08-18: no panic, and the link
+    # trains at this rate on every display-sleep wake --
+    #   [LINK_TRAINING] noLanes=2, ASR=1, downspread=0 BitRate = 10
+    #   [LINK_TRAINING] laneMask=0xff, laneStatus=0x77
+    # BitRate = 10 is decimal for 0x0A, and 0x77 is a fully locked 2-lane link,
+    # so 2 lanes x HBR really does carry this panel's 138.50 MHz timing exactly
+    # as the bandwidth arithmetic above predicted.
+    #
+    # BUT BE CLEAR ABOUT WHAT THIS DID AND DID NOT FIX.  Changing 0x14 -> 0x0A
+    # did NOT fix the black-screen-after-display-sleep bug: with 0x0A and the
+    # old 0x3E9B0000 framebuffer the panel still died on every DPMS off, with
+    # laneStatus=0 through 8 clock-recovery retries.  The real cause was the
+    # framebuffer layout (see the igpu block above).  0x0A is retained because
+    # it is the FAQ's correct value for a 1080p panel, it is provably sufficient
+    # here, and it is what the working link is actually running at -- not
+    # because it was the fix.  The earlier note claiming otherwise was wrong.
+    #
+    # STILL OPEN: whether this pair is needed at all now that the layout is
+    # correct.  The pair was introduced to stop a divide-by-zero panic under
+    # -igfxblt, and that panic was diagnosed while the wrong layout was in
+    # place, so it may have been a symptom of the same root cause.  Worth
+    # testing by removing both keys -- separately from any other change, with
+    # a revert script staged, because the failure mode is a boot panic.
     "enable-dpcd-max-link-rate-fix": D("01000000"),
     "dpcd-max-link-rate":            D("0A000000"),
 }

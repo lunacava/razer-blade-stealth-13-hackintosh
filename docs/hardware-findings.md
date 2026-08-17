@@ -218,6 +218,12 @@ Reddit の投稿者は **BIOS 1.06 を改造して DVMT 64MB** にしていた�
 本機の BIOS 1.01 には DVMT の設定項目が存在しない（コメントの Viscel2al も同じ状況で質問している）。
 実機レジストリでも `HardwareInformation.MemorySize = 0 0 0 64` (= 32MB 相当の pre-alloc) を確認。
 
+> **2026-08-18 追記**: この節は `AAPL,ig-platform-id = 0x3E9B0000` 時代の記述。
+> レイアウトは **`0x3EA50009` / `device-id 0xA53E0000`** に変更済み（理由は発見 10）。
+> ただし本節の結論は両方に等しく当てはまる: 要求 STOLEN は同じ 57MB/58MB で、
+> `framebuffer-stolenmem` / `framebuffer-fbmem` の値も connector 構成（DP×2）も
+> そのまま有効。実機で framebuffer 3個の enumerate を再確認済み。
+
 `0x3E9B0000` フレームバッファは **STOLEN 57MB / TOTAL 58MB** を要求するため、
 32MB のままでは WhateverGreen マニュアルの通り **カーネルパニックする**:
 
@@ -862,3 +868,142 @@ itlwm の速度について: 2020年時点の報告は 20Mbps（802.11n 相当�
 その後 v1.1.0 以降で 802.11ac に対応済みなので、現在の AirportItlwm 2.3.0 では改善している。
 ただし **AirDrop / Handoff / Sidecar は Broadcom チップ固有機能なので使えない**（Reddit でも
 「airdrop が欲しければ BCM94360NG に交換」という流れになっているが、本機は CNVi のため交換不可）。
+
+## ★★ 発見 10: ディスプレイスリープ後の黒画面は eDP リンクトレーニング失敗だった（2026-08-18 解決）
+
+### 症状
+
+macOS は正常に起動して画面も出る。しかし **一度でもディスプレイが DPMS off になると
+（`pmset displaysleepnow`、アイドルタイムアウト、あるいはホットコーナーの Display Sleep）
+二度と画面が戻らない**。ユーザーは右上ホットコーナーに Display Sleep を割り当てていたため、
+これを頻繁に踏んでいた。
+
+ユーザーによる 3点の物理観察が、探索空間を一撃で潰した:
+
+| 観察 | 排除できるもの |
+|---|---|
+| 懐中電灯で照らしても**何も見えない** | バックライト系すべて（PWM、PNLF、`-igfxblt`、`max-backlight-freq`）。バックライト故障なら「暗いが見える」になる |
+| 輝度キーを押しても戻らない | 同上 |
+| 蓋を閉じて開けても戻らない | 「再接続で治る」系のワークアラウンド全部。lid open は再トレーニングを走らせるが、それが失敗しているので無意味 |
+
+つまり **画像信号そのものが出ていない**。バックライトではなく **リンク**の問題。
+
+### 決定的トレース（失敗時、`AAPL,ig-platform-id = 0x3E9B0000`）
+
+```
+Panel power ON time was 228 ms        <- パネルには通電している
+PP_STATUS=0x80000008
+SetupOptimalLaneCount LaneCount=2 BitRate=0xa
+SetupDPTimings pixelClock=138500000 linkSymbolClock=270000000
+EnableClocks:12937 PLL successfully enabled
+ConfigureBufferTranslation: BT: Using eDP eye   <- ここでレイアウト由来の電気パラメータを使う
+Clock Recovery Initated, Retry Count = 0..7     <- 8回
+IG:: LinkTraining:932 HW strength setting=0x0 -> 0x4 -> 0x87
+[Link_Training] (request01=0 -> 0x11 -> 0x22 -> 0x33) Voltage=0 -> 3
+[Link_Training] laneMask=0xff, laneStatus=0     <- 毎回 0
+dpAuxChRead/Write ... Status:0                  <- AUX は全部成功
+[WARNING] Failed Phase 1 of Link Training
+[ERROR  ] Link training failed - notifying AGDC to take display offline
+[ERROR  ] [AGDC] AGDC not registered. Unmanaged display
+[ERROR  ] [Modeset] Not successful. Disabling display
+```
+
+読み方:
+
+- **AUX は完全に正常**。全トランザクションが `Status:0`（成功）で、シンク側が
+  ADJUST_REQUEST（`request01`）に「もっと振幅を上げろ」と書き込んできている。
+  つまりパネルは通電済み・アドレス可能・会話可能。当初「AUX が壊れている」と疑ったが外れ。
+- にもかかわらず **`laneStatus=0`**、すなわち CR_DONE が一度も立たない。ドライバは電圧を
+  0→3、HW strength を 0→0x87 まで上げ切っても駄目。
+- **電気的パラメータが panel に合っていない**ことを示す典型的な形。
+
+### 根本原因: フレームバッファレイアウトが間違っていた
+
+WhateverGreen `FAQ.IntelHD` の記載:
+
+> Recommended framebuffers:
+> Desktop: `0x3EA50000` (default), `0x3E9B0007` (recommended)
+> **Laptop: `0x3EA50009` (default)**
+
+> For UHD620 (**Whiskey Lake**) fake `device-id` **`A53E0000`** for `IGPU`.
+
+本構成は `0x3E9B0000` + `device-id 0x3E9B` で動いていた。これは
+**2つの異なるレシピの片方ずつを混ぜたもの**。
+
+（訂正: 当初「`0x3E9B0000` はデスクトップ用レイアウト」「末尾 0000 系はデスクトップ」と
+書いたが、これは誤り。FAQ の CFL/CML 表では `0x3E9B0000` は **mobile / 3 connector / 58MB**
+と明記されている。欠陥は「デスクトップ用だった」ことではなく、
+**laptop default ではないこと**、および `0x3E9B` が Whiskey Lake の
+正規の fake device-id ではないことである。）
+
+`ConfigureBufferTranslation: BT: Using eDP eye` が、この
+レイアウトから eDP のアイパターン（電圧スイング / プリエンファシスのテーブル）を
+取り出す。そこが間違っていたので、どの rate でもどの電圧でもリンクが張れなかった。
+
+### 修正と確認（`0x3EA50009` + `device-id 0xA53E0000`）
+
+`pmset displaysleepnow` → wake を 4回連続、全部成功:
+
+```
+[Modeset] FB0: Complete modeset
+[Modeset] Lighting up eDP
+IG:: EnableClocks:12937 PLL successfully enabled
+[LINK_TRAINING] Running fast link training          <- "regular" ではない
+[LINK_TRAINING] noLanes=2, ASR=1, downspread=0 BitRate = 10
+[LINK_TRAINING] voltage=0, preEmphasis=0            <- 最低ドライブ強度
+[LINK_TRAINING] laneMask=0xff, laneStatus=0x77      <- 完全ロック
+```
+
+- `laneStatus=0x77` = lane0 の `CR_DONE|CHANNEL_EQ_DONE|SYMBOL_LOCKED` (0x01|0x02|0x04)
+  ＋ lane1 の同じ 3bit (0x10|0x20|0x40)。**2レーン完全ロック**。
+- **リトライ 0回、電圧 0**。以前は電圧 3 / strength 0x87 まで上げて 8回失敗していた。
+  最低強度で一発で通るということは、このレイアウトの eDP アイパターンが
+  「たまたま許容範囲」ではなく **正しい**という意味。
+- `Failed Phase 1` / `Link training failed` / `Not successful. Disabling display` は
+  この起動で **0件**。
+- アクセラレーションは無傷: Device ID `0x3ea5`、VRAM 1536MB、Metal 3、
+  framebuffer 3個、Online: Yes、新規パニックなし。
+
+### 副産物: `dpcd-max-link-rate` の値は「無害な上限」ではない
+
+当初 `0x14` (HBR2) を「リンクトレーニングが下方ネゴシエートする上限だから高い方が安全」
+という理屈で設定していた。**この理屈は誤り**で、FAQ は解像度ごとの指定を求めている:
+
+> "Typically use `0x14` for 4K display and `0x0A` for 1080p display.
+> All possible values are `0x06` (RBR), `0x0A` (HBR), `0x14` (HBR2), `0x1E` (HBR3)."
+
+本機パネルは **Sharp LQ133M1JW41**（13.3" 1920x1080 eDP、実機 EDID の
+`ioreg AppleBacklightDisplay` → `IODisplayEDID` 内のディスクリプタ文字列から同定）。
+FAQ がこの修正の代表例として挙げているのがまさに Sharp eDP パネル
+（"Dell Inspiron 7590 with Sharp display"）。
+
+`0x0A` で足りることは同じ EDID の detailed timing から出る:
+
+```
+pixel clock = 0x361A = 13850     -> 138.50 MHz
+payload     = 138.50 MHz * 24bpp -> 3.324 Gbps
+8b/10b      = 3.324 / 0.8        -> 4.155 Gbps 必要
+2 lane * 2.7 Gbps (HBR)          -> 5.400 Gbps 利用可能
+headroom                          = 1.30x
+```
+
+ドライバ自身のログ (`pixelClock=138500000, linkSymbolClock=270000000,
+colorDepth=24, noLanes=2`) と一致する。
+
+**ただし `0x14` → `0x0A` の変更はこのバグを直していない。** `0x0A` にしても
+`0x3E9B0000` のままでは同じく `laneStatus=0` で失敗した。`0x0A` を維持しているのは
+FAQ 準拠で、実測十分で、実際にリンクがこの rate で走っているからであって、
+修正だったからではない。
+
+注意: カーネルログの DPCD ダンプは**パネルの素の能力の確認には使えない**。
+WEG が AUX 読み出しをフックした後に `GetDPCDInfo` がダンプを出すので、
+`14 14 C2 41` は自分が注入した値が見えているだけ。
+このパネルの真の最大リンクレートは未観測。
+
+### 未解決として残したこと
+
+`enable-dpcd-max-link-rate-fix` / `dpcd-max-link-rate` のペアが、レイアウトが
+正しくなった今でも必要かは**未検証**。このペアは `-igfxblt` 下のゼロ除算パニック対策として
+入れたが、そのパニックの診断は間違ったレイアウトのまま行われたので、
+同じ根本原因の別症状だった可能性がある。外して試す価値はあるが、
+失敗モードが起動パニックなので、他の変更と混ぜず、revert スクリプトを用意して単独で行う。
