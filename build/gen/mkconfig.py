@@ -502,20 +502,54 @@ config = {
             #               the search target was confirmed present in the
             #               shipped binaries (1x in bluetoothd, 2x in BlueTool).
             #
-            #               NOT YET CONFIRMED WORKING on this machine.  One thing
-            #               argues for caution: our board-id already appears in
-            #               bluetoothd's own 43-entry board-id table, so that
-            #               table is several sub-lists and we are presumably in
-            #               the UART one.  Whether the patched USB entry wins
-            #               depends on evaluation order, which was not read out
-            #               of the binary.  If Bluetooth still does not come up,
-            #               the next lever is a non-T2 SMBIOS -- but that changes
-            #               the serial and MLB, so it needs a decision about
-            #               re-verifying the Apple ID already signed in here.
+            #               CONFIRMED EFFECTIVE 2026-08-18 for transport selection
+            #               specifically: after adding it the log flipped to
+            #                 HCI Transport is set to USB
+            #               and system_profiler reports "Transport: USB" instead
+            #               of UART.  bluetoothd's USB backend then runs and
+            #               correctly finds the controller:
+            #                 [bm3_usb][GetProductAndVendorID] -- Found USB Device
+            #                     idVendor = 0x8087  idProduct = 0x0AAA
+            #                     deviceClass = 0xE0 (224)   <- Wireless Controller
+            #               So the earlier worry -- that our board-id also being
+            #               present in bluetoothd's own 43-entry table might make
+            #               the UART entry win -- did not materialise.
             "boot-args": "-v debug=0x100 keepsyms=1 alcid=30 -igfxblt -btlfxboardid",
             "csr-active-config": D("00000000"),
             "prev-lang:kbd": D("656E2D55533A30"),   # en-US:0
             "run-efi-updater": "No",
+            #
+            # Bluetooth internal-controller variables.  Fixing the transport was
+            # necessary but not sufficient: with transport = USB, bluetoothd
+            # found the right device and then still failed --
+            #   [bm3_usb][GetProductAndVendorID] -- Use internal Bluetooth USB
+            #     Host Controller
+            #   [bm3_usb][IOThreadFunc] -- Can't obtain vendorID and productID
+            #     -- try again
+            # i.e. it fails on the *internal controller* check, immediately after
+            # deciding to treat this as the built-in controller.
+            #
+            # BrcmPatchRAM's README requires exactly these two, under this GUID,
+            # for macOS 12+ with BlueToolFixup, and states they are "required for
+            # at least Intel Bluetooth to work":
+            #   bluetoothExternalDongleFailed   = 00
+            #   bluetoothInternalControllerInfo = 14 zero bytes
+            # BlueToolFixup's -btlfxnvramcheck boot-arg is the alternative (it
+            # NOPs the equivalent check inside bluetoothd, see
+            # kSkipInternalControllerNVRAMCheck13_3 in BlueToolFixup.cpp, gated
+            # to Sonoma and older) but the README calls it "much less efficient",
+            # so set the variables instead.
+            #
+            # These go in Add ONLY, deliberately not in Delete.  Neither variable
+            # exists in this machine's NVRAM (checked with `nvram -p | grep -i
+            # bluetooth`, empty), and OpenCore's Add writes variables that do not
+            # already exist -- so Add alone takes effect here.  Leaving them out
+            # of Delete also lets macOS maintain its own values afterwards, which
+            # is the normal steady state once Bluetooth works.
+            #
+            # NOT YET CONFIRMED WORKING on this machine.
+            "bluetoothExternalDongleFailed":   D("00"),
+            "bluetoothInternalControllerInfo": D("0000000000000000000000000000"),
         },
     },
     "Delete": {
