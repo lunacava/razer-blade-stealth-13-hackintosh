@@ -216,6 +216,56 @@ igpu = {
     # exactly -- internal eDP panel plus USB-C and Thunderbolt 3, no HDMI.
     # Forcing con1/con2 to DP would be a no-op, so it is omitted rather than
     # carried as dead config.
+    #
+    # DPCD maximum-link-rate fix.  Without this, enabling acceleration panics
+    # the machine the instant WindowServer programs the internal panel:
+    #
+    #   panic(cpu 6 caller ...): Kernel trap at ..., type 0=divide error
+    #   ... RBX: 0x0, RDX: 0x0 ...
+    #   Panicked task ...: pid 149: WindowServer
+    #   com.apple.driver.AppleIntelCFLGraphicsFramebuffer :
+    #     AppleIntelFramebufferController::SetupDPTimings(...) + 0x19b
+    #     <- AppleIntelFramebufferController::SetupClocks(..., CRTCParams*)
+    #
+    # (Reproduced identically twice: Kernel-2026-08-18-005635.panic and
+    # Kernel-2026-08-18-011253.panic.  Roughly 30 s after EXITBS, which is why
+    # it looked like a "reboot loop" rather than a graphics fault -- and why
+    # debug=0x100 did not hold a panic screen the user could read.)
+    #
+    # RBX and RDX are both zero at the trap, so the rate that SetupDPTimings
+    # divides by arrived as zero: the DPCD read for this panel did not yield a
+    # usable maximum link rate on the path that feeds it.  WhateverGreen hooks
+    # AppleIntelFramebufferController::GetDPCDInfo -- the call that feeds that
+    # divisor -- and substitutes a valid rate.  Verified against the shipped
+    # binary rather than from documentation: WhateverGreen 1.7.0's __TEXT
+    # contains "enable-dpcd-max-link-rate-fix", "dpcd-max-link-rate", the
+    # mangled symbol ...GetDPCDInfo..., and the log string
+    #   "MLR: [COMM] ProbeMaxLinkRate() Failed to read supported link rates
+    #    from DPCD."
+    #
+    # 0x14 = HBR2, 5.4 Gbps/lane.  The panel is 1920x1080 @ 60 Hz 24-bit,
+    # ~3.2 Gbps of payload, so a single lane at this rate already covers it and
+    # link training negotiates down from here -- the value is a ceiling, not a
+    # demand.  Set explicitly instead of relying on WhateverGreen's internal
+    # default so the value is visible in the config.
+    #
+    # CONFIRMED ON HARDWARE 2026-08-18.  With this pair added and -igfxblt kept,
+    # the machine booted to the desktop and stayed up with no panic, where the
+    # identical config without them panicked ~30 s after EXITBS twice in a row.
+    # VRAM went 7 MB -> 1536 MB, Metal 3 came up, and all three framebuffers
+    # (internal eDP + 2x DP) enumerated -- i.e. nothing was traded away for the
+    # fix.  The kernel log now shows the divisor arriving as a sane value:
+    #   (AppleIntelCFLGraphicsFramebuffer) [DPCD_Info] FB0: Display port config
+    #     ver is 1.4
+    #   ... [DPCD_Info] FB0 Maximum link rate is 0x14
+    #   ... [DPCD_Info] FB0: Maximum lanes is 2
+    # Note the log cannot distinguish WhateverGreen's injected 0x14 from a
+    # native read of 0x14, so this is evidence the divisor is no longer zero,
+    # not proof of which code path supplied it.  The causal link is still solid:
+    # -igfxblt alone panicked reproducibly, -igfxblt plus these two keys does
+    # not.  Do not drop them on the theory that the panel "reports 0x14 anyway".
+    "enable-dpcd-max-link-rate-fix": D("01000000"),
+    "dpcd-max-link-rate":            D("14000000"),
 }
 
 dev_props = {
@@ -424,7 +474,32 @@ config = {
         "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102": ["rtc-blacklist"],
         "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38E36": ["DefaultBackgroundColor", "UIScale"],
         "7C436110-AB2A-4BBB-A880-FE41995C9F82": [
-            "boot-args", "csr-active-config", "prev-lang:kbd", "run-efi-updater"],
+            "boot-args", "csr-active-config", "prev-lang:kbd", "run-efi-updater",
+            # recovery-boot-mode: deleted unconditionally, and NOT paired with an
+            # entry in Add -- we never want to request a recovery mode, only to
+            # make sure a stale request cannot survive a reboot.
+            #
+            # boot.efi writes this itself when a boot fails repeatedly.  Observed
+            # on 2026-08-17: after the kernel hard-reset ~30s past
+            # EXITBS (accelerated iGPU config), the fourth boot logged
+            #   AAPL: #[EB|R:SRBM] fde-recovery
+            #   AAPL: #[EB|LW+]                       (login window, in EFI)
+            #   AAPL: #[EB.CS.AUV|VU!] Err(0xF)       (unlock volume failed)
+            #   AAPL: #[EB|RESET] 1
+            #   AAPL: #[EB|LOG:RESET:FAIL]
+            # i.e. boot.efi escalated to FileVault recovery, failed to unwrap
+            # the volume encryption key, and reset.  (FileVault IS on here --
+            # `fdesetup status` reports "FileVault is On" -- but on a modern
+            # sealed-system-volume install only the Data volume is encrypted,
+            # so the accompanying `fv_unwrap_vek: No kek blob provided for sys
+            # disabled volume` is expected and is not itself the fault.)
+            # That is self-sustaining: the variable survives the reset, so every
+            # subsequent boot lands in the same EFI login window regardless of
+            # what caused the original failure.  It looks exactly like a macOS
+            # login loop, but it is pre-kernel -- the trackpad is dead because
+            # VoodooI2C has not loaded yet, while the keyboard still works
+            # because the firmware drives it.
+            "recovery-boot-mode"],
     },
     "LegacyOverwrite": False, "LegacySchema": {}, "WriteFlash": True,
 },
