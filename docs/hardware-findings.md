@@ -363,7 +363,7 @@ macOS 13.4 以降、Apple が CFL フレームバッファドライバの `Write
 | タッチスクリーン | VoodooI2C でそのまま動作 | **本機にタッチスクリーンは無い**（実機確認済み） |
 | DSDT | 差し替え（dsdt.aml を配置） | **差し替えない**（SSDT ホットパッチのみ） |
 | **スリープ** | **未解決**（画面が壊れて再起動が必要） | **RWAK LIDS パッチで対策**（0x16796、一意性検証済み） |
-| **外部ディスプレイ** | **未解決**（接続でフリーズ） | 既定 DP connector が一致。要実機検証 |
+| **外部ディスプレイ** | **未解決**（接続でフリーズ） | **解決**（左 USB-C で 1920x1080@60、フリーズなし。発見 23） |
 | **バッテリー残量** | ski_net が未解決 | **ECEnabler で解決**（16bit EC フィールドが原因と特定） |
 | SMBIOS | — | **MacBookPro15,2**（ski_net が「15,2 でのみスリープした。15,4 と 16,3 は駄目」と報告） |
 
@@ -439,7 +439,7 @@ WhateverGreen の `framebuffer-stolenmem = <00003001>`(19MB) / `framebuffer-fbme
 
 **向こうが 6 年解けていない課題（誰も回答なし）:**
 - スリープ復帰で画面が壊れて再起動が必要 → **こちらは `RWAK` offset `0x16796` を特定済み**（発見 2）。おそらく同じ原因
-- 外部ディスプレイを挿すとフリーズ → フェーズ 2 の課題として残す
+- 外部ディスプレイを挿すとフリーズ → **こちらでは起きない**（発見 23、実機で拡張デスクトップ動作）
 
 ## ★ 発見 8: USB インストーラは 2GB で足りる
 
@@ -3050,3 +3050,78 @@ EVENT page=0x0c usage=0xea value=1        ← 音量ダウン（対照実験）
 権限の要らない 2 つの計測で、そこまで正確に切り分けられた。
 `log show` が空だったのを「イベントが無い」と読んでいたら、
 `BrightnessKeys.kext` を入れて再起動して、また空振りしていた。
+
+## ★★ 発見 23: 外部ディスプレイは動く。左 USB-C のみで、右は BIOS 側の帰結（2026-08-18 23:20 実測）
+
+Reddit の同型機報告（発見 6 の対照表）で **6 年間誰も回答していない**「外部ディスプレイを
+挿すとフリーズ」は、**この構成では発生しない**。実機で拡張デスクトップが成立した。
+
+### 実測: 左 USB-C
+
+```
+Display:                          HDMI:
+  1920 x 1080 @ 60.00Hz             1920 x 1080 @ 60.00Hz
+  30-Bit Color (ARGB2101010)        30-Bit Color (ARGB2101010)
+  Main Display: Yes                 Adapter Type: Thunderbolt/DisplayPort
+  Mirror: Off                       Mirror: Off
+  Connection Type: Internal         Online: Yes
+```
+
+`HDMI` という名前はアダプタが申告したもので、経路は DP alt mode である
+（`Adapter Type: Thunderbolt/DisplayPort`）。**内蔵パネルと同時に、両方 30bit で、
+ミラーではなく拡張**として出た。フリーズも再起動もパニックも無し。
+
+フレームバッファの割り当ても筋が通っている:
+
+| ノード | `IOFBCurrentPixelClock` | 実体 |
+|---|---|---|
+| `AppleIntelFramebuffer@0` | 138.5 MHz | 内蔵 eDP パネル |
+| `AppleIntelFramebuffer@1` | **148.5 MHz** | **左 USB-C（1920x1080@60 の CEA 値）** |
+| `AppleIntelFramebuffer@2` | （無し） | 未使用 = TB3 側 |
+
+DP リンクのやり取りも正常で、`IG:: DoDisplayPortTransaction:245 Data 8 / 8`
+のように**要求バイト数と転送バイト数が一致**している。`IG::` のエラー/失敗行は 0 件。
+
+### ★ 予測が実測で裏付けられた: `connector-type` パッチは本当に不要だった
+
+発見 6 で「本機は HDMI が無く USB-C×2 なので既定の DP×2 と一致する。
+`framebuffer-con1/con2-type` は no-op だから積まない」と**推論で削った**判断が、
+ここで実測に変わった。パッチ無しで DP が素直に出た。
+
+### 右 USB-C が映らないのは故障ではなく設定の帰結
+
+右は Thunderbolt 3 ポートで、**DP alt mode の mux は Alpine Ridge (JHL6240) の中にある**。
+`docs/bios-settings.md` で **Thunderbolt = Disabled** にしているので、そのコントローラは
+電源が落ちている → mux が動かない → 映像が出ない。iGPU の DDI 直結である左とは経路が違う。
+
+つまり `AppleIntelFramebuffer@2`（DP connector 2 本目）は macOS 側に存在しているが、
+**その先の物理経路が BIOS で切られている**状態。macOS の設定ミスではない。
+
+### 右を生かす場合の実験と、その根拠
+
+BIOS で Thunderbolt = Enabled に戻す。**`AppleThunderboltNHI` の Block は外さない。**
+
+元のハードリセット（発見なし・`Previous shutdown cause: 5`、2 回再現）は
+「BIOS で Disabled なのに PCI には列挙され、レジスタが全部 `0xffffffff` を返す
+**死んだデバイス**に対して NHI が DMA リングを確保しようとした」ことが原因だった:
+
+```
+AppleThunderboltNHITransmitRingManager::allocateTransmitRing Flags: 0x1
+AppleThunderboltNHIReceiveRingManager::allocateReceiveRing  Flags: 0x1
+```
+
+Block が入っている限り **NHI はそもそもロードされない**ので、この経路は原理的に
+発火しない。そして DP alt mode の mux はコントローラのファームウェア/ハードウェア側で
+処理されるため、**OS の Thunderbolt ドライバを必要としない**。だから
+「TB3 に電源を入れる + NHI は載せない」で右ポートの映像だけ得られる可能性がある。
+
+**未検証。** 期待できる利点は右ポートの映像と、DP connector が 2 本あるので
+**外部 2 画面**。リスクは起動不良だが、**BIOS 内で Disabled に戻すだけで完全に戻せる**
+（ESP を書き換えないので OpenCore 側の revert 作業は不要）。
+
+### 未検証として残すもの
+
+- 外部ディスプレイを繋いだ状態での S3 スリープ/復帰（一般に壊れやすい箇所）
+- 蓋を閉じてクラムシェル運用（`AppleClamshellCausesSleep = Yes` なので、
+  外部画面だけで使うには電源接続 + 外部入力が必要）
+- 1920x1080 より高い解像度 / 60Hz より高いリフレッシュレート

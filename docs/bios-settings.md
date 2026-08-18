@@ -26,7 +26,7 @@
 | **Secure Boot** | **Disabled** | ✅ | OpenCore は署名されていないので必須 |
 | **Fast Boot** | **Disabled** | ✅ | USB 初期化をスキップするため、インストーラ USB が見えなくなる |
 | **CSM Support** | **Disabled** | ✅ | Windows は `winload.efi` = UEFI ネイティブ起動なので安全に無効化できる（実機確認済み）。macOS は UEFI 専用 |
-| **Thunderbolt** | **Disabled** | ✅ | TB3 コントローラ (JHL6240) は macOS で不安定要因。フェーズ2で再検証 |
+| **Thunderbolt** | **Disabled** | ✅ | TB3 コントローラ (JHL6240) は macOS で不安定要因。**副作用: 右 USB-C の映像が出ない**（DP mux が JHL6240 内にあるため。左 USB-C は iGPU 直結で動作 → 発見 23） |
 | **TPM / PTT** | **Disabled** | ✅ | macOS が扱えない。BitLocker は復号済みなので影響なし |
 | **Intel VMX (VT-x)** | **Enabled のまま** | ✅ | macOS に無害。無効にすると WSL2 / Hyper-V が壊れる。macOS が嫌うのは **VT-d** の方で、そちらは `DisableIoMapper=YES` で対処済み（DMAR テーブル存在を確認） |
 | **Hyper-Threading** | **Enabled のまま** | ✅ | i7-8565U は 4C/8T。無効にする理由がない |
