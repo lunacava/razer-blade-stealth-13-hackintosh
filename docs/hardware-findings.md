@@ -3119,9 +3119,146 @@ Block が入っている限り **NHI はそもそもロードされない**の�
 **外部 2 画面**。リスクは起動不良だが、**BIOS 内で Disabled に戻すだけで完全に戻せる**
 （ESP を書き換えないので OpenCore 側の revert 作業は不要）。
 
+### ★ 外部ディスプレイを繋いだままの S3 も通る（2026-08-18 23:30 実測）
+
+一般に壊れやすい箇所だが、無事だった。**しかもバッテリー駆動での初のスリープ試験**でもある
+（発見 10b の 21:44 と 22:24 はいずれも AC 接続だった）。
+
+```
+23:30:23  Sleep  'Software Sleep pid=23835'  TCPKeepAlive=active  Using Batt (Charge:79%)  46 secs
+23:31:09  Wake   Wake from Normal Sleep [CDNVA] : due to XDCI/UserActivity  Using BATT (79%)
+```
+
+復帰後の検証:
+
+| 確認項目 | 結果 |
+|---|---|
+| `kern.boottime` | **19:17:50 のまま** = 再起動していない |
+| パニックファイル | 新規ゼロ（既存は 00:56〜01:12 で、この起動より前） |
+| 内蔵 + 外部 | **両方** 1920x1080@60 / 30bit で復帰 |
+| フレームバッファ | `@0` 138.5MHz + `@1` 148.5MHz、スリープ前と同一 |
+| `brtd`（輝度キー） | **pid 23602 のまま** = 再起動もクラッシュもせず生存 |
+
+`Wake reason` が `XDCI` なのは発見 10b で誤読と確定済みの見え方で、実際の復帰要因は
+`UserActivity`（キー押下）である。
+
+### ★ 罠: 復帰時の `[IGFB][ERROR]` は正常な遷移ノイズ
+
+復帰の瞬間、23:31:09〜11 の 2 秒間だけエラー行が並ぶ:
+
+```
+[IGFB][LOG][GTPM_SLEEPWAKE] [Transition_wake] Invalidate PIPE-B HTOTAL!
+[IGFB][ERROR] FB1 Not waiting for in set gamma to solid color as path state is not active
+[IGFB][ERROR] setAttribute called when FB2 is in a sleep state - attribute: 'pwrs'
+[IGFB][ERROR] FB1: The color mode = 0x100 is not RGB for DP
+[IGFB][ERROR] TxnHang1: FB1: IsTransactionComplete called following fakeVBL notification
+[IGFB][ERROR] FB1: Flip called without enabling VBL
+[IGFB][ERROR] FB1: VBlank Timeout Timer called in 51ms - fTransactionState = 0x0, fLiveState = 0x0 fOnline: 1
+```
+
+**これを故障と読んではいけない。** 最終状態は両画面 30bit で正常、`fOnline: 1` は
+オンラインを意味し、`not RGB for DP` も一過性（確定値は `ARGB2101010`）。
+パイプの再プログラム中に順序前後があるだけで、2 秒後には収束している。
+この機種は本物のグラフィックス障害が「ハードリセット」や「3 分ブラックスクリーン」
+という形で出る（発見 6）ので、**画が出ていてログだけ賑やかな状態は追わなくてよい。**
+
+### ★ クラムシェル運用は AC 必須（実測から判明）
+
+復帰後の `PMRD` が毎秒こう出している:
+
+```
+PMRD: clamshell closed 0, disabled 0/0, desktopMode 1, ac 0
+PMRD: Clamshell enabled / setClamShellSleepDisable(1->0)
+```
+
+**`desktopMode 1`** = 外部ディスプレイを認識して「デスクトップモード」に入っている。
+これがクラムシェル運用の前提条件。ただし **`ac 0` = バッテリー駆動**であり、この状態で
+`setClamShellSleepDisable(1->0)`（クラムシェルスリープを再び有効化）が走っている。
+
+→ **バッテリーのまま蓋を閉じると、外部画面があっても寝る。**
+外部画面だけで使うには **AC 接続 + 外部キーボード/マウス**が必要（Apple 純正機と同じ条件）。
+発見 21 の `AppleClamshellCausesSleep = Yes` と整合する。
+
 ### 未検証として残すもの
 
-- 外部ディスプレイを繋いだ状態での S3 スリープ/復帰（一般に壊れやすい箇所）
-- 蓋を閉じてクラムシェル運用（`AppleClamshellCausesSleep = Yes` なので、
-  外部画面だけで使うには電源接続 + 外部入力が必要）
+- 実際に蓋を閉じたクラムシェル運用（AC + 外部入力を揃えた状態での確認）
 - 1920x1080 より高い解像度 / 60Hz より高いリフレッシュレート
+- 外部ディスプレイの音声出力（DP audio）
+
+## ★ 発見 24: 「ディスプレイを挿すとキーボード設定アシスタントが出る」の原因はディスプレイではない（2026-08-18 23:29 特定）
+
+外部ディスプレイを接続するたびにキーボード設定アシスタントが起動する。
+**ディスプレイは無関係で、ドックのハブにぶら下がった USB ドングルが原因。**
+
+### 計測
+
+```
+/Library/Preferences/com.apple.keyboardtype.plist
+  "keyboardtype" => {
+    "4-8526-0"   => 40      GesturePoint Mouse Dongle (Swiftpoint)  登録済み
+    "569-5426-0" => 40      Razer Blade 内蔵キーボード              登録済み
+  }
+                          ← 2.4G Receiver (Compx) の記録が無い ★
+```
+
+キーの書式は `<ProductID>-<VendorID>-<CountryCode>`（すべて 10 進）。
+`40` は ANSI。ユーザ側 `~/Library/Preferences/com.apple.keyboardtype.plist` は存在しない。
+
+未登録のデバイスはこれ:
+
+```
+IOHIDInterface  "Product" = "2.4G Receiver"
+                "VendorID" = 9639 (0x25a7 Compx)   "ProductID" = 64097 (0xfa61)
+                "PrimaryUsagePage" = 1   "PrimaryUsage" = 6    ← キーボードとして申告
+                "CountryCode" = 0                              ← レイアウト不明
+```
+
+USB ツリー上の位置が「ディスプレイと連動する」理由を説明する:
+
+```
+USB2.1 Hub (Genesys 05e3:0610) @ 0x14100000/18     ← USB-C ドック
+  └ USB2.0 Hub (05e3:0608)     @ 0x14120000/20
+      └ 2.4G Receiver          @ 0x14121000/21     ← これ
+```
+
+ドックを挿す = ディスプレイが繋がる = 同時にこのハブ鎖が列挙される
+= ドングルが再列挙される → アシスタントが出る、という連鎖だった。
+
+時刻の裏付け: ディスプレイを接続した直後の **23:25:43** に
+`KeyboardSetupAssistant` が pid 23772 として起動している。
+
+```
+23:25:43  runningboardd: Calculated state for
+          app<application.com.apple.KeyboardSetupAssistant...(501)>:23772>:
+          running-active (role: UserInteractiveFocal)
+23:26:30  runningboardd: Invalidating assertion ... from originator
+          [osservice<com.apple.WindowServer(88)>:155]
+```
+
+**ただしログはデバイス名を出さない。** 「どのデバイスが引き金か」は plist の
+欠落エントリと USB 階層からの推定であり、ログはタイミングの一致までしか示していない。
+確定させるなら、下記の対処を適用して再現しなくなることを確認するのが早い。
+
+### なぜ「毎回」なのか
+
+アシスタントは記録を書くために「shift の隣のキーを押せ」と要求する。
+このドングルは**実際のキーボードではない**（無線マウス/リモート系がキーボード
+interface を持っているだけ）ので該当キーを送れず、**完了できない → 記録が書かれない
+→ 次も出る**。閉じても解決しないのはこのため。同じ理由で
+Swiftpoint 側も usage 6 を持っているが、そちらは既に登録されている。
+
+### 対処: 記録を手で書く
+
+```
+sudo defaults write /Library/Preferences/com.apple.keyboardtype.plist \
+  keyboardtype -dict-add "64097-9639-0" -int 40
+```
+
+`-dict-add` なので既存 2 件は保持される。実際にタイプするデバイスではないので
+値が ANSI(40) でも実害はない。
+
+### 教訓
+
+「X をすると Y が起きる」の X は、しばしば真の原因ではなく**同時に起きる別の事象**である。
+ここでは「ディスプレイ接続」と「ハブ配下の USB 再列挙」がドック 1 本に束ねられていた。
+`system_profiler SPUSBDataType` の**階層**を見るまで、ディスプレイ側を疑う理由しかなかった。
