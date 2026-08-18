@@ -1272,14 +1272,43 @@ TotalPackets: 1527768   TotalFrames: 5768
 
 は、既に破棄済みの IN エンドポイント (0x81) に対する後片付けメッセージで**無害**。
 
-### 未確認として残る点
+### ★ 絵の中身も確認済み（2026-08-18 15:08、画像データで確定）
 
-**絵の中身（真っ黒でないか）は未確認。** MJPEG は真っ黒な被写体でもフレームを配送するので、
-30 fps 安定配送だけでは中身を保証しない。目視、または後述の画面収録許可が必要。
+当初は「絵の中身は未確認」として残していた。MJPEG は真っ黒な被写体でもフレームを
+配送するので、30 fps 安定配送だけでは中身を保証しないという理由である。これを
+**実画像の画素統計で潰した。**
+
+手順は Photo Booth で1枚撮影 → JPEG を SSH で回収 → PNG に変換して自力デコードし、
+4px 間隔でサンプリングした 21,600 画素の統計を取る、というもの。
+
+```
+720x480 JPEG, 52,830 bytes
+luma  mean=147.5  sd=90.3  min=10  max=255
+channel means  R=150.5  G=145.9  B=147.8
+histogram (16 bins, 各 16 luma 幅, per-mille):
+    12  146   88   40   42   46   39   40   49   39   32   22   14   22   17  345
+```
+
+- **mean=147.5 / sd=90.3** — 真っ黒なら mean≒0, sd≒0 になる。明暗差のある実シーン
+- **16 ビン全部に分布** — 単色塗りでもノイズでもない。暗部 146‰、白飛び 345‰（窓光）
+- **R/G/B の平均がほぼ等しい** — 緑被り・紫被りといった UVC のフォーマット誤認なし。
+  ホワイトバランスも正常
+- 目視でも鮮明でピントが合っており、上下左右の反転もない
+
+したがって内蔵カメラは**転送・デコード・色・向きのすべてが正常**。追加 kext もパッチも不要。
 
 なお USB ポートマッピング（USBToolBox）は**まだ実施していない**。それでもカメラの
 アイソクロナス転送が 30 fps で成立しているので、少なくともこのポートの
 記述は実用上問題ない。
+
+### 手法メモ: SSH セッションからカメラは掴めない
+
+自動化のため AVFoundation で1フレーム取得する Swift プログラムを書こうとしたが、
+これは筋が悪い。`kTCCServiceCamera` の許可レコードがユーザ TCC.db に1件も無く、
+SSH セッションには許可ダイアログを出す手段がないため、TCC に無言で弾かれる。
+
+**GUI アプリ（Photo Booth）に撮らせて、生成物を SSH で回収して解析するのが正解。**
+実アプリ経由なので end-to-end の確認にもなる。
 
 ## ★ 発見 12: SSH 越しの `screencapture` はウィンドウを無言で剥がす
 
@@ -1355,3 +1384,51 @@ ssh host '/usr/bin/log show --start "..." | wc -l'  -> 1812091
 - **ERROR レベルを最初に見ること。** `[IGFB][ERROR ]` で絞れば
   `hwSetPanelPower : Timeout powering ON the panel!!` が一行で出ていた。
   LOG レベルの `laneStatus` を延々追う前にこれを見るべきだった。
+
+## ★ 発見 14: このマシンの `swiftc` は壊れている（CLT の残骸ファイル）
+
+macOS 側で小さな検証プログラムを書こうとすると、`swiftc` が Foundation すら
+ビルドできずに失敗する。
+
+```
+/Library/Developer/CommandLineTools/usr/include/swift/module.modulemap:13:8:
+  error: redefinition of module 'SwiftBridging'
+→ 連鎖して error: could not build module 'CoreServices'
+                could not build module 'Foundation'
+                could not build module 'ApplicationServices'
+```
+
+### 原因
+
+同じディレクトリに、同じモジュールを宣言したファイルが2つ残っている。
+
+```
+-rw-r--r--  root  wheel  581  Dec  4  2024   bridging.modulemap
+-rw-r--r--  root  wheel  581  Aug 18  2023   module.modulemap     ← 古い残骸
+```
+
+中身は同一で、両方が `module SwiftBridging { header "bridging" export * }` を宣言。
+clang はそのディレクトリの modulemap を全部読むので衝突する。
+
+**日付が答え。** 新しい CLT（16.2.0、2024-12）がこのファイルを `module.modulemap` から
+`bridging.modulemap` に改名したが、インストーラが古い CLT（2023-08 = 15.x 系）の
+`module.modulemap` を削除しなかった。アップグレード時の典型的な残骸で、
+**ハッキントッシュ固有の問題ではない。**
+
+実機の環境自体は正常:
+
+```
+com.apple.pkg.CLTools_Executables  version: 16.2.0.0.1.1733547573
+Apple Swift version 6.0.3 (swiftlang-6.0.3.1.10 clang-1600.0.30.1)
+Target: x86_64-apple-macosx14.0
+xcode-select -p → /Library/Developer/CommandLineTools
+```
+
+### 直し方
+
+古い方を削除ではなく改名する（中身が同一なので戻せる）。
+
+```
+sudo mv /Library/Developer/CommandLineTools/usr/include/swift/module.modulemap \
+        /Library/Developer/CommandLineTools/usr/include/swift/module.modulemap.disabled
+```
