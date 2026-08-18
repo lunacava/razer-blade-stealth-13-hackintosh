@@ -1263,6 +1263,198 @@ hwSetPanelPower : Timeout powering ON the panel!!
 遅延を持っている可能性がある）。ただし本命は VBT 側であり、
 WEG のノブでは届かない領域に入っている可能性が高い。
 
+### ★★ 2026-08-18 決着: 真因は `camelliaVersion = 3`（VBT でもタイミングでもなかった）
+
+> **直前の 2 段落（「本命は VBT 側」「未試行は `0x3E920009` / `0x3E9B0009`」）は
+> 撤回する。** どちらも外れ。原因は**プラットフォームデータのたった 1 フィールド**で、
+> しかも **WhateverGreen に専用のノブが存在する**。推測ではなく、実機に入っている
+> バイナリを逆アセンブルして確定させた。
+
+#### 調べ方（再現手順）
+
+Sonoma のグラフィクス kext は `/System/Library/Extensions/` にはスタブしか無く、
+本体は KernelCollection の中にある。CFL は **`BootKernelExtensions.kc` ではなく
+`SystemKernelExtensions.kc`** 側（ロードアドレスが `0xffffff7f…` 系で、
+`0xffffff80…` ではないことから判る。最初に BootKC を探して 62 MB 無駄に転送した）。
+
+1. `LC_FILESET_ENTRY`（cmd `0x80000035`）のテーブルを走査して
+   `com.apple.driver.AppleIntelCFLGraphicsFramebuffer` のエントリを見つける
+   （`/tmp/kcparse.py`）。
+2. この種の fileset は **`fileoff == vmaddr`** なので、`dd` で素朴に切り出した
+   バイナリがそのままアドレス付きで逆アセンブルできる。
+   `BASE=0x14070000`, `END=0x1412c000` → `/tmp/cfl.bin`（770,048 バイト）。
+   SYMTAB（`symoff=0x150efe30`, `nsyms=3521`, `stroff=0x1529a640`）から
+   シンボル 2931 個 → `/tmp/cfl.syms`（`/tmp/kcextract.py`）。
+3. 逆アセンブルは **capstone**（`pip3 install --user capstone`）。
+   Xcode の `llvm-objdump` には `-b binary` が無く、`llvm-mc` も同梱されていない。
+   線形 sweep は途中で同期が外れて既知の参照を取りこぼすので、
+   **シンボル境界で関数ごとに**逆アセンブルする（`scan2.py`）。
+   （罠: スクリプトを `dis.py` と名付けると標準ライブラリの `dis` を隠して
+   capstone の import が壊れる。`disx.py` に改名した。）
+
+**そして最大の反省点**: `[IGFB][LOG  ]` レベルのメッセージは
+**素の `log show` には出ない**。`log show --info --debug` が必要。
+これまで ERROR 行しか見ていなかったので、「パネルプロパティ」経路や
+`PP_STATUS=%#x` の存在に何ヶ月も気付かなかった。
+
+#### 確定した因果
+
+プラットフォームデータのテーブルは**実行時に構築される**（`__common` に即値を
+書き込むコードがある）ので、静的なテーブルとしては grep できない。
+レイアウト `0x3EA50009` の構造体は `0x14127600`（サイズ `0xb0`）で:
+
+```
+0x140db018  movabs r14, 0x400000003
+0x140db022  mov    qword [0x14127660], r14      ; 0x14127600 + 0x60
+```
+
+`struct+0x60` は **`camelliaVersion`** で、値は **3**。
+（WEG の `kern_fb2.hpp` の `FramebufferCFL` を手で並べると `camelliaVersion` は
+ちょうど `0x60`、構造体全体が `0xb0` — 22.0.5 の実バイナリと完全一致。
+つまり WEG の構造体定義はこの OS バージョンでも正しい。）
+
+`camelliaVersion` は「Apple 製 TCON（パネル側タイミングコントローラ）が
+載っているか」を決めるフィールドである: 2 → `CamelliaTcon2`、
+3 → `BanksiaTcon`、0 → どちらも無し。
+`AppleIntelFramebufferController::start()`:
+
+```
+0x1409b41b  cmp   dword [rax+0x60], 3
+0x1409b425  lea   rax, [rip+0x81a2c]            ; <__ZN11BanksiaTcon9metaClassE>
+0x1409b438  mov   qword [rbx+0x2e68], rax
+```
+
+→ ドライバは **`BanksiaTcon` を生成する**。`BanksiaTcon` は実機 Retina MacBook Pro の
+パネルに載っているチップで、**本機の Sharp LQ133M1JW41 には存在しない**。
+`InitTcon` は（AUX が通らなくても）成功扱いで進むらしく、
+`[rbx+0x2e68]` は非 NULL のまま残る。ここから 2 つの結果が出る:
+
+**(a) PP_ON_DELAYS がゼロにされる。** `hwSetPanelPowerConfig`:
+
+```
+0x1409fc94  cmp   qword [rbx+0x2e68], 0          ; TCON あり?
+   → ログ "Override power up delays to optimize"
+0x1409fcc3  mov   dword [rbx+0x2c20], 0          ; PP_ON_DELAYS = 0
+```
+
+つまり**直そうとしていた遅延値は、意図的に捨てられていた**。
+ログの "Override power up delays to optimize" は症状ではなく、
+TCON 経路に入った証拠だった。
+
+**(b) 存在しないチップを 2.2 秒ポーリングする。** `hwSetPanelPower(2)`:
+
+```
+0x140aa0b7  cmp   qword [rbx+0x2e68], 0          ; 同じ判定
+   TCON 経路: r13d = 0x1e (= 30 回)
+       WriteCamelliaReg(0x10200DE, 1, 0xC)
+       ReadCamelliaReg (0x10200E9, 1, &v)
+       IOSleep(0x14)                             ; 20 ms
+0x140aa28e  （抜けた先）
+   → 0x140f95de "[IGFB][ERROR  ] %s : Timeout powering ON the panel!!"
+```
+
+30 × (AUX 失敗 + 20 ms) ≒ **2.2 秒**。
+実測は 7/7 で 2.170 / 2.248 / 2.255 / 2.250 / 2.253 / 2.184 / 2.197 秒。
+これは「約 2.2 秒に近い」のではなく、**このループそのもの**である。
+
+**`camelliaVersion == 0` なら通る経路**（`0x140aa242`）:
+
+```
+r15d = 0x32 (= 50 回)
+    IOSleep(0x19)                                ; 25 ms
+    PP_STATUS & 0xB0000000 == 0x80000000 ?        ; ON かつシーケンサ完了かつ
+                                                 ; power-cycle-delay 未消化でない
+0x140aa42a  成功
+```
+
+これが**普通の eDP パネルが実際に完了できる経路**で、しかも
+PP_ON_DELAYS をゼロにしない。
+
+#### 参考: PCH パネル電源レジスタ（CFL）
+
+| Addr | Reg | 内容 |
+|---|---|---|
+| `0xC7200` | PP_STATUS | bit31 = パネル ON / bits 29:28 = シーケンス進行 / bit27 = power cycle delay 中 |
+| `0xC7204` | PP_CONTROL | bit0 = ON 要求 / bit1 = power-down on reset / bit3 = backlight enable / bits 8:4 = power cycle delay |
+| `0xC7208` | PP_ON_DELAYS | 28:16 = 電源投入 T1+T3 / 12:0 = バックライト ON T8（単位 100 µs） |
+| `0xC720C` | PP_OFF_DELAYS | 28:16 = 電源切断 T10 / 12:0 = バックライト OFF T9 |
+
+#### 打ち手その 1（採用）: `framebuffer-camellia`
+
+WEG はこのフィールドをそのまま公開している。`kern_igfx.cpp:1473`:
+
+```cpp
+framebufferPatchFlags.bits.FPFCamelliaVersion =
+    WIOKit::getOSDataValue(igpu, "framebuffer-camellia",
+                           framebufferPatch.camelliaVersion);
+```
+
+`framebuffer-patch-enable` に依存するが、それは既に投入済みで、
+`framebuffer-stolenmem` / `framebuffer-fbmem` が効いていることから
+**この機種で実際に機能することが確認済み**。値 0 でも
+`getOSDataValue` はプロパティの存在で真を返すので、`= 0` は正しく伝わる
+（`kern_igfx.cpp:1751` で `frame->camelliaVersion` に代入される）。
+
+```
+PciRoot(0x0)/Pci(0x2,0x0)
+    framebuffer-camellia   <00000000>
+```
+
+**「WhateverGreen に該当ノブは無い」という上の結論は、この 1 つに関して誤り
+だった。** PSR / FBC / PWM のノブを探していて、TCON のノブを探していなかった。
+
+#### 打ち手その 2（保留）: `AAPL00,Panel*` — 未公開だが実在する注入経路
+
+`AppleIntelFramebufferController::hwGetPanelTimingProperties()` は iGPU の
+provider から 5 つの `OSNumber` プロパティを読み、`PP_ON_DELAYS` /
+`PP_OFF_DELAYS` / `PP_CONTROL[8:4]` を直接プログラムする:
+
+| プロパティ | 単位 | 変換 | Apple 内蔵の既定 |
+|---|---|---|---|
+| `AAPL00,PanelPowerUp` | ms | ×10 → PP_ON_DELAYS[28:16] | 12.5 ms |
+| `AAPL00,PanelPowerOn` | ms | ×10 → PP_ON_DELAYS[12:0] | 210 ms |
+| `AAPL00,PanelPowerDown` | ms | ×10 → PP_OFF_DELAYS[28:16] | 74 ms |
+| `AAPL00,PanelPowerOff` | ms | ×10 → PP_OFF_DELAYS[12:0] | 250 ms |
+| `AAPL00,PanelCycleDelay` | ms | ÷100 + 1 → PP_CONTROL[8:4] | 500 ms |
+
+（既定値はバイナリ中の即値 `0x02E409C4007D0834` と除数 6 から。
+この経路に入るには `AAPL00,PanelPowerOn` が存在して非ゼロである必要がある。）
+
+**意図的に保留する。** 実験は 1 回に 1 変数。`framebuffer-camellia = 0` は
+(a) により PP_ON_DELAYS の破棄も同時に止めるので、これ単独で直る見込みがある。
+タイミング注入は第 2 ラウンド用に取っておく。
+
+#### 検証方法（判定基準を先に決めておく）
+
+`IG: TCON:` 行が **`BanksiaTcon` 初期化の直接の指標**。修正前の実測ベースライン
+（`camelliaVersion = 3`、boot 17:33:32、`log show --info --debug` を起動時刻で絞ったもの）:
+
+| パターン | 修正前 | 修正後の期待 |
+|---|---|---|
+| `IG: TCON` | **2** | **0** |
+| `hwSetPanelPower` | 2 | 2 |
+| `default EDP panel timings` | 2 | — |
+| `Override power up delays` | 0 | 0 |
+| `Timeout powering` | 0（この boot は消灯試験をしていない） | **0**（消灯試験後も） |
+| `panel properties` | 0 | 0（第 2 ラウンドまでは） |
+
+判定スクリプトは実機の `~/panelchk.sh`（sudo 不要）。
+
+#### 安全上の前提
+
+このパネルは**電源を落とすと戻らない（7/7）**ので、消灯試験は
+「戻らなければ再起動するまで真っ暗」の片道切符である。したがって試験前に:
+
+1. **ESP をアンマウントしておく**（`diskutil unmount disk0s5`）。
+   ジャーナル無しの FAT32 をマウントしたまま電源を落としたのが、
+   過去に `VirtualSMC` を壊した原因。
+2. **画面が見えなくても叩ける再起動手段を用意しておく。**
+   `osascript -e 'tell application "System Events" to restart'` は
+   **不適**と判明した: `rc=0` を返すのに再起動せず（`kern.boottime` 不変）、
+   2 回目の呼び出しは `UserNotificationCenter` の Automation 許可ダイアログで
+   ハングした。**画面上の GUI ダイアログに依存する手段は、
+   画面が見えない状況の復旧手段として原理的に使えない。**
+
 ### 副産物: `dpcd-max-link-rate` の値は「無害な上限」ではない
 
 当初 `0x14` (HBR2) を「リンクトレーニングが下方ネゴシエートする上限だから高い方が安全」

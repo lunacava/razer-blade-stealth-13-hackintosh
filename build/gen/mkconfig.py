@@ -441,15 +441,78 @@ acpi_patch = [
 # Acceleration survived the switch: Device ID 0x3ea5, VRAM 1536 MB, Metal 3,
 # 3 framebuffers enumerated, display Online / Main Display Yes, no new panics.
 #
-# Still untried: the other two 3-connector mobile layouts 0x3E920009 /
-# 0x3E9B0009, on the chance their platform data carries different panel power
-# delays.  That is a long shot -- the likely home of the fix is the VBT, which
-# WhateverGreen's Intel knobs do not reach.  What is actually deployed is the
-# workaround: never power the panel off.  See docs/hardware-findings.md.
+# ★ RETRACTION (2026-08-18).  The two paragraphs above -- "the real fix would
+# have to live in the VBT" and "still untried: 0x3E920009 / 0x3E9B0009" -- are
+# WRONG.  The cause was found by disassembling the actual shipped binary,
+# AppleIntelCFLGraphicsFramebuffer 22.0.5, carved out of this machine's
+# /System/Library/KernelCollections/SystemKernelExtensions.kc.  It is not the
+# VBT, not the platform ID, and not a timing value: it is ONE FIELD in the
+# platform data, camelliaVersion, and WhateverGreen does have a knob for it.
+#
+#   The driver builds its platform table at runtime (immediates written into
+#   __common, which is why no static table is greppable).  For our layout
+#   0x3EA50009 the struct lives at 0x14127600 (size 0xb0) and:
+#
+#     0x140db018  movabs r14, 0x400000003
+#     0x140db022  mov    qword [0x14127660], r14     ; struct+0x60
+#
+#   struct+0x60 is camelliaVersion -> 3.  In AppleIntelFramebufferController::
+#   start():
+#
+#     0x1409b41b  cmp   dword [rax+0x60], 3
+#     0x1409b425  lea   rax, [rip+0x81a2c]           ; BanksiaTcon::metaClass
+#     0x1409b438  mov   qword [rbx+0x2e68], rax
+#
+#   so the driver instantiates a BanksiaTcon -- the timing-controller chip on a
+#   real Retina MacBook Pro panel.  This laptop has a plain Sharp LQ133M1JW41
+#   eDP panel with no such chip.  Two things then go wrong:
+#
+#   (a) hwSetPanelPowerConfig, 0x1409fc94: `cmp qword [rbx+0x2e68], 0` -- with a
+#       TCON present it logs "Override power up delays to optimize" and at
+#       0x1409fcc3 does `mov dword [rbx+0x2c20], 0`, i.e. it ZEROES PP_ON_DELAYS.
+#       The delays we were trying to fix were being thrown away on purpose.
+#
+#   (b) hwSetPanelPower(2), 0x140aa0b7: same test on [rbx+0x2e68].  The TCON
+#       branch loops r13d=0x1e (30) times over
+#           WriteCamelliaReg(0x10200DE, 1, 0xC)
+#           ReadCamelliaReg (0x10200E9, 1, &v)
+#           IOSleep(0x14)                            ; 20 ms
+#       waiting for a chip that will never answer -> 30 x (failed AUX + 20 ms)
+#       ~= 2.2 s, then falls through to 0x140aa28e and logs
+#           "[IGFB][ERROR  ] %s : Timeout powering ON the panel!!"
+#       The measured black-screen duration was 2.170-2.255 s across 7/7 cycles.
+#       That is not "close to" 2.2 s, it is the loop.
+#
+#   With camelliaVersion == 0 the driver takes the generic path at 0x140aa242
+#   instead: r15d=0x32 (50) iterations of IOSleep(0x19) (25 ms) polling
+#   PP_STATUS & 0xB0000000 == 0x80000000 -- i.e. "panel on, sequencer idle, no
+#   power-cycle-delay pending" -- and succeeds at 0x140aa42a.  That is the path
+#   an ordinary eDP panel can actually complete, and it keeps the real
+#   PP_ON_DELAYS instead of zeroing them.
+#
+# WhateverGreen exposes exactly this field.  kern_igfx.cpp:1473:
+#   framebufferPatchFlags.bits.FPFCamelliaVersion =
+#       WIOKit::getOSDataValue(igpu, "framebuffer-camellia",
+#                              framebufferPatch.camelliaVersion);
+# It is gated on framebuffer-patch-enable, which is already set above and
+# already proven to work here (stolenmem/fbmem take effect).
+#
+# One variable at a time: camellia alone first.  If the panel still fails to
+# come back, round two is the five AAPL00,Panel* properties
+# (PanelPowerUp / PanelPowerOn / PanelPowerDown / PanelPowerOff in ms, and
+# PanelCycleDelay), which AppleIntelFramebufferController::
+# hwGetPanelTimingProperties() reads off the iGPU node and programs straight
+# into PP_ON_DELAYS / PP_OFF_DELAYS / PP_CONTROL[8:4].  Apple's built-in
+# fallbacks are 12.5 / 210 / 74 / 250 ms with a 500 ms cycle delay.
+# See docs/hardware-findings.md.
 igpu = {
     "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
     "device-id":                D("A53E0000"),   # 0x3EA5, WHL fake per FAQ
     "framebuffer-patch-enable": D("01000000"),
+    # camelliaVersion 3 -> 0.  Stops the driver instantiating a BanksiaTcon it
+    # can never talk to; see the disassembly above.  This is the fix for the
+    # 2.2 s "Timeout powering ON the panel!!" that made display sleep fatal.
+    "framebuffer-camellia":     D("00000000"),
     # The framebuffer wants 57 MB stolen (58 MB total) but this
     # BIOS pre-allocates only 32 MB DVMT and exposes no setting to raise it
     # (verified: registry HardwareInformation.MemorySize, and no DVMT item in
