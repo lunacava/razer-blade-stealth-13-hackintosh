@@ -3281,3 +3281,76 @@ sudo defaults write /Library/Preferences/com.apple.keyboardtype.plist \
 「X をすると Y が起きる」の X は、しばしば真の原因ではなく**同時に起きる別の事象**である。
 ここでは「ディスプレイ接続」と「ハブ配下の USB 再列挙」がドック 1 本に束ねられていた。
 `system_profiler SPUSBDataType` の**階層**を見るまで、ディスプレイ側を疑う理由しかなかった。
+
+## ★★ 発見 25: Wi-Fi はスリープ復帰で落ちることがある → 有線 LAN は外さない（2026-08-19 00:11 実測）
+
+「作業がほぼ終わったので Mac mini と Razer の間の有線 LAN は不要では」という判断を
+実測で検証したところ、**否定された**。有線は残す。
+
+### 経緯: 楽観的な読みが直接試験で覆った
+
+先行して 23:30 のスリープ後に `en0` が `status: active` かつアドレス保持だったので、
+「Wi-Fi はスリープを越えられる」と読んだ。**この読みは間違いだった。**
+Wi-Fi 経由でスリープ→復帰→Wi-Fi 経由で再接続を直接試すと:
+
+```
+00:11:49  wake（airportd: systemWokenByWiFi: wake reason <XDCI>, was not woken by WiFi）
+          AUTO-JOIN: Auto-join triggered (trigger=screen_off, mode=best)
+00:12:4x  ssh 192.168.2.190 → Operation timed out
+00:12:5x  ssh 192.168.2.190 → Operation timed out
+00:13:01  ssh 192.168.2.190 → 成功（3回目）
+00:14:xx  en0 status: inactive / "You are not associated with an AirPort network."
+          ping ×60 → 100.0% packet loss ("Host is down")
+```
+
+**一度繋がってから完全に落ちた。** つまり「復帰が遅い」ではなく**不安定**である。
+23:30 の回は生き残っていたので、決定論的な故障ではなく**間欠**。
+これが AirportItlwm（サードパーティ Intel ドライバ）の弱点で、
+有線 LAN が保険をかけていたのは正確にこの部分だった。**保険は正当だった。**
+
+### 復旧は sudo 無しの 1 行で足りる
+
+```
+networksetup -setairportpower en0 off; sleep 3; networksetup -setairportpower en0 on
+```
+
+これで `status: active` / `Current Wi-Fi Network: elecom-4e2303a` に戻り、
+ping 0% loss、SSH も通る。再起動は不要。
+
+### 教訓: 「落ちていない」の観測は「落ちない」の証拠にならない
+
+23:30 の観測（復帰 20 分後に `en0` が active）は本物のデータだが、
+**間欠故障に対しては 1 サンプルの成功は何も保証しない。**
+知りたかったのは「Wi-Fi だけでリモート作業を続けられるか」であり、
+それを答えられるのは「Wi-Fi 経由で寝かせて Wi-Fi 経由で戻る」試験だけだった。
+遠隔からアクセス手段を捨てる判断は、その手段自体で往復させて確かめる。
+
+### 有線を残すことの副作用（承知の上で受け入れる）
+
+| 事項 | 内容 |
+|---|---|
+| Mac mini | `bootpd -d -D -i en8`（10.42.0.0/24 の DHCP）+ インターネット共有 + pf 変更が稼働継続。`tools/share-off.sh` は保留 |
+| 経路 | Razer の default gateway は `10.42.0.1` = **Mac mini が寝ると Razer のネットが死ぬ** |
+| USB | AX88179A が 1 ポート占有、スリープ要因に `USBExternalDevice` が載る |
+
+### 将来ケーブルを捨てたい場合
+
+復帰時に `en0` が未 associated なら上記 1 行を叩く watchdog を LaunchAgent で常駐させる
+（`tools/brtd` と同じ形）。**未実装。** それを入れるまでは有線が唯一の信頼できる経路。
+
+### ★ 副産物: `192.168.2.190` のホスト鍵衝突は攻撃ではない
+
+macOS と Windows が同じ IP を共有しているため、OS を切り替えるたびに
+`Host key ... has changed` が出る。`known_hosts` の 39〜41 行目は
+**Windows の 3 つのホスト鍵**（ed25519 / rsa / ecdsa）である。
+
+鍵が本物であることは**信頼できる有線経路から独立に確認した**（これが正しい検証手順で、
+`StrictHostKeyChecking=no` で潰してはいけない）:
+
+```
+Wi-Fi で提示   SHA256:hjtOpmZvVJN5qiFJOm7cLyUbHYlIh8VNL5RG1d9ChSs
+有線経由で実体 SHA256:hjtOpmZvVJN5qiFJOm7cLyUbHYlIh8VNL5RG1d9ChSs (ED25519) ✅
+```
+
+恒久対処は `~/.ssh/config` で `HostKeyAlias` を分けること（`razer-macos` / `razer-windows`）。
+有線と Wi-Fi に**同じ** alias を与えると、経路が変わっても 1 エントリで済む。

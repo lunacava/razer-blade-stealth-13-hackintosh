@@ -198,7 +198,7 @@ Boot-args: `-v debug=0x100 keepsyms=1 alcid=30 -igfxblt -btlfxboardid`
 |---|---|
 | NVMe / APFS / RTC | Dual-boot with Windows 11 on the same disk |
 | Battery percentage | ECEnabler — the 16-bit EC field is the cause (finding 4) |
-| Wi-Fi | AirportItlwm (native UI). No AirDrop/Handoff/Sidecar — Broadcom-only features |
+| Wi-Fi | AirportItlwm (native UI). No AirDrop/Handoff/Sidecar — Broadcom-only features. **Intermittently does not survive sleep/wake** (finding 25); recover with `networksetup -setairportpower en0 off/on`. This is why the wired link to the Mac mini stays |
 | Audio | AppleALC `alcid=30` |
 | Trackpad | VoodooI2C + VoodooI2CHID. Force Click disabled so deep presses register as normal clicks |
 | USB | USBToolBox + UTBMap, 9 ports on `XHC`. External USB-A corrected from `UsbConnector 255` to `3` |
