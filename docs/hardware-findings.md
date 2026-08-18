@@ -1120,8 +1120,28 @@ defaults -currentHost write com.apple.screensaver idleTime -int 0      # スク�
 
 2026-08-18 に実機へ適用済み: `wvous-tr-corner` は 10 → 1、`idleTime` は既に 0。
 
-**蓋閉じは別経路で、これらでは抑止できない。** ただし本機は
-`AppleClamshellCausesSleep = No` と報告している（実測未確認）。
+**蓋閉じは安全（2026-08-18 実測）。** 当初「別経路なので抑止できない穴」と
+書いていたが、実測で否定された。上記 3 つを適用した状態で蓋を 22 秒閉じて開けた結果:
+
+```
+14:26:55  LID CLOSED        （ioreg AppleClamshellState: No -> Yes）
+14:27:17  LID OPENED        （Yes -> No）
+
+hwSetPanelPower の遷移      : 0 件（ログに一行も出ない）
+Timeout powering ON the panel: 0 件
+laneStatus                  : 0 件（リンク再訓練が発生していない）
+Entering Sleep state        : 0 件
+復帰後 IODisplayWrangler    : CurrentPowerState = 4
+復帰後 bklt                 : 65535
+```
+
+クラムシェル状態自体は正しく検出されている（`No` → `Yes` → `No`）ので、
+センサは動いている。それでもパネル電源遷移が一件も発生しない。つまり本機の
+macOS では**蓋閉じがパネル電源のオフに配線されていない**。
+`AppleClamshellCausesSleep = No` の申告と整合する。
+
+限定: 閉じていたのは 22 秒で、長時間の閉じは未検証。ただし `displaysleep 0` に
+してあるためアイドルタイマが存在せず、時間経過で発火する経路は残っていない。
 
 #### 真因の詰め方: パネル電源シーケンサ
 

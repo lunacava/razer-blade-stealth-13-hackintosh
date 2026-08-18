@@ -345,8 +345,21 @@ acpi_patch = [
 #     defaults write com.apple.dock wvous-tr-corner -int 1 && killall Dock
 #     defaults -currentHost write com.apple.screensaver idleTime -int 0
 # Applied on hardware 2026-08-18: wvous-tr-corner 10 -> 1, idleTime already 0.
-# Lid close is a separate path and none of these cover it, though the machine
-# reports AppleClamshellCausesSleep = No (not verified by experiment).
+# With all three in place the mitigation is complete and verified: after a
+# reboot, `hwSetPanelPower` logs only hwSetPanelPowerConfig at 14:20:36 -- no
+# state=0 -> state=2 transition exists, so the broken path is never entered,
+# and there are zero timeouts and zero laneStatus lines for the whole boot.
+#
+# LID CLOSE IS SAFE, contrary to what this note previously claimed.  Measured
+# 2026-08-18: lid closed 14:26:55, opened 14:27:17 (ioreg AppleClamshellState
+# No -> Yes -> No, so the sensor does fire), and across that window there were
+# zero hwSetPanelPower transitions, zero timeouts, zero laneStatus lines and no
+# "Entering Sleep state"; afterwards IODisplayWrangler was still
+# CurrentPowerState=4 with bklt=65535, and the user confirmed the picture never
+# went away.  Lid close is simply not wired to a panel power-down on this
+# machine, which is consistent with AppleClamshellCausesSleep = No.  Caveat:
+# the lid was closed for 22 s; a long close is untested, but with
+# displaysleep 0 there is no idle timer left to fire.
 #
 # WHERE THE REAL FIX WOULD HAVE TO LIVE, and why WhateverGreen cannot reach it.
 # The failing cycle logs "Using the default EDP panel timings" and "Override
