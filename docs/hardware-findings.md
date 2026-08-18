@@ -2071,6 +2071,41 @@ SHA256 `83c0a9eb623ba0bc1a59b87b94eb12096254aa1ed9222cea1ef911c709428599`。
 | `GFX0@0` / `pci10de,1d10` が**消える** | ベンダ `_OFF` が成功し dGPU が電源から落ちた（成功） |
 | RZDX は出るが GFX0 も残る | `_INI` は走ったが `_OFF` が効かない別問題。`RZOF` のフォールバック `HGOF` 側を疑う |
 
+### ★ 実機で検証済み: 成功（2026-08-18 17:34、修正後の初回起動）
+
+上の表の 2 行目、狙ったとおりの結果になった。
+
+```
+=== RZDX in device tree? ===
+    +-o RZDX  <class IOACPIPlatformDevice, id 0x1000001f4, registered, matched, active, busy 0 (3 ms)>
+
+=== dGPU (pci10de,1d10 / GFX0) still enumerated? ===
+GFX0 NOT IN IOService
+
+=== any 10de PCI device left? ===
+0
+```
+
+- `RZDX` が `IOACPIPlatformDevice` として出現 → `_STA` 修正で namespace 走査が
+  到達し、`_INI` → `RZDG()` → `RZOF()` → ベンダ `_OFF()` が実行された
+- **`pci10de` を持つ `IOPCIDevice` はゼロ。** MX150 は PCI から完全に消えた
+- `system_profiler SPDisplaysDataType` も `Intel UHD Graphics 620`（`0x3ea5`）ただ 1 つ
+- dGPU がいたルートポートは**空のブリッジだけが残った**:
+
+```
++-o RP05@1C,4  <class IOPCIDevice, registered, matched, active>
+| +-o IOPP     <class IOPCI2PCIBridge, registered, matched, active>     ← 子なし
+```
+
+副作用なし。内蔵ディスプレイは iGPU に付いたまま 1920×1080 / Metal 3 /
+Connection Type Internal で正常（以前は `IONDRVFramebuffer` が dGPU 側にも
+生えていたが、それも一緒に消えた）。新規のパニックレポートも無し
+（最新は `Kernel-2026-08-18-011253.panic` で今回の作業より前のもの）。
+
+**消費電力の実測はまだできていない。** 検証時は AC 接続・満充電で
+`InstantAmperage = 0` だったため、バッテリ駆動での前後比較が取れない。
+公称 3-5 W の節約が実際に出ているかは、バッテリ運用時に改めて測ること。
+
 ### 教訓
 
 ダミーデバイスで `_INI` を撃つパターンでは **`_STA` を書かない**か、書くなら
