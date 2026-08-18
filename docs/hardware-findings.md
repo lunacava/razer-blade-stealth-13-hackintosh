@@ -1199,6 +1199,52 @@ defaults -currentHost write com.apple.screensaver idleTime -int 0      # スク�
 
 2026-08-18 に実機へ適用済み: `wvous-tr-corner` は 10 → 1、`idleTime` は既に 0。
 
+> **★ この回避策は 2026-08-18 21:10 に解除した。** 真因（`camelliaVersion = 3`）が
+> 判明して直ったので「消さない」で凌ぐ必要が無くなった。現行の設定は下記
+> 「ディスプレイスリープ復活」を参照。`wvous-tr-corner = 1` と `idleTime = 0` は
+> そのまま残してあるが、これは好みの問題であって回避策ではない。
+
+#### ディスプレイスリープ復活（2026-08-18 21:10）
+
+`framebuffer-camellia = 0` の検証が済んだので消灯を戻した。同時に、
+S3 の失敗要因として知られている hibernate 系を潰した。**これらは消灯とは
+別の問題**で、S3 を試す前に片付けておくべきもの:
+
+```bash
+sudo pmset -a hibernatemode 0     # 3 だった。スリープ毎に 1.0 GB の sleepimage を書く
+sudo pmset -a standby 0           # 1 だった。3h/24h 後に hibernation へ遷移する
+sudo pmset -a powernap 0          # AC で 1 だった。定期的な自動 wake がループの種
+sudo pmset -a womp 0              # Wake on LAN。USB Ethernet 経由の意図しない復帰を防ぐ
+sudo pmset -a proximitywake 0     # Apple Continuity 前提で本機では無意味
+sudo pmset -c displaysleep 10 -b displaysleep 5
+```
+
+適用後の状態:
+
+| | Battery | AC |
+|---|---|---|
+| `hibernatemode` | 0 | 0 |
+| `standby` | 0 | 0 |
+| `powernap` | 0 | 0 |
+| `womp` | — | 0 |
+| `proximitywake` | 0 | 0 |
+| `displaysleep` | 5 | 10 |
+| `sleep` | **0（意図的に維持）** | **0（同）** |
+
+`hibernatemode 3` が既に `/var/vm/sleepimage` を 1.0 GB 作っていた
+（`-rw------T root wheel 1.0G Aug 18 19:18`）。`hibernatemode 0` にしたので
+今後は使われない。消したければ消せるが、放置しても害は無い。
+
+**`sleep`（S3）はまだ 0 のまま。** パネル電源とは別のコードパスで未検証。
+発見 2 の `RWAK` LIDS パッチ（offset `0x16796`）が既に入っているが、
+S3 復帰そのものは一度も通していない。
+
+**S3 試験のときの注意: `ttyskeepawake` が 1 である。**
+つまり **SSH セッションが繋がっている間はシステムスリープしない。**
+消灯試験には影響しなかったが、S3 では効いてくる。
+`sudo pmset -a ttyskeepawake 0` にするか、SSH を切ってから
+`pmset -g log` を後で読む形にする必要がある。
+
 **蓋閉じは安全（2026-08-18 実測）。** 当初「別経路なので抑止できない穴」と
 書いていたが、実測で否定された。上記 3 つを適用した状態で蓋を 22 秒閉じて開けた結果:
 
