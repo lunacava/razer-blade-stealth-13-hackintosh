@@ -2081,3 +2081,123 @@ present を立てる。`_STA = Zero` は「OS から隠す」ではなく「こ�
 実行されたことは別問題で、OpenCore のログは前者しか教えてくれない。今後 SSDT を
 足すときは、効果そのものを ioreg で確認できる観測点（今回なら `RZDX` ノードの有無）を
 必ず用意すること。
+
+---
+
+## ★★★ 発見 20: ESP の FAT が壊れていた — 起動中の `VirtualSMC` に 2 KB のゴミが入っていた
+
+発見 17 で「`VirtualSMC` のバイナリが `EFI/OC` と `EFI/BOOT` で違う。動いているのは
+BOOT 側。今は触らない」と書いて放置した差分の正体を調べたら、**BOOT 側が壊れていた**。
+
+### どちらが正しいかは一発で決まった
+
+| 場所 | SHA256 (先頭) |
+|---|---|
+| ESP `EFI/OC/Kexts/VirtualSMC.kext` | `865f736ae87654ee` |
+| ESP `EFI/BOOT/Kexts/VirtualSMC.kext` | `856a9044043ac1ed` |
+| **公式リリース** `downloads/x_VirtualSMC-1.3.7-RELEASE/` | **`865f736ae87654ee`** |
+| リポジトリ内の他 23 コピー全部 | `865f736ae87654ee` |
+
+サイズ（245408）も `CFBundleVersion`（1.3.7）も mtime も同一なのに中身が違う。
+DEBUG ビルドとの取り違えならサイズが変わるので、それでもない。**BOOT 側だけが
+どこにも一致しない孤児**だった。
+
+### 壊れ方
+
+```
+$ cmp -l OC/.../VirtualSMC BOOT/.../VirtualSMC | awk '...'
+first: 145409  last: 147456  span: 2048  count: 2045
+```
+
+**ちょうど 2048 バイト（0x23800–0x23FFF、512 バイト境界揃い）だけが化けている。**
+中身を見ると:
+
+```
+OC   : 830201807deb037204c645eb0283ec0c8d45eb6a00688800000068756938206a
+BOOT : 252c24242424252c252c252c252c242424242424242491a1140b252c252c252c
+```
+
+OC 側は素直な x86-64 コード（`68 75 69 38` = SMC のキー型 `ui8` のリテラルが見える）。
+BOOT 側は `25 2c 24 24 24 24` の繰り返しで、コードでもデータでもない。
+**1 クラスタ分がまるごと別の内容で上書きされた FAT レベルの破損。**
+
+### つまり、これまで起動していた macOS は
+
+**`__TEXT` の真ん中に 2 KB の穴が空いた `VirtualSMC` を読み込んで動いていた。**
+`kmutil showloaded` には `as.vit9696.VirtualSMC (1.3.7)` として正常にロードされて
+見える。Mach-O のヘッダ構造は無傷なのでカーネルは受け入れるし、OpenCore は kext の
+内容を検証しない。壊れた領域が呼ばれない冷たい関数だったので無症状だった、というだけ。
+**そこに実行が届いた瞬間にパニックする爆弾**であり、SMC キー・バッテリ・スリープ
+まわりの原因不明の挙動を疑うとき、この線を排除できていなかった。
+
+### ESP 全体の健全性を確認した
+
+破損が他にもあるかを、ESP の全 `.efi` / `.aml` / `Kexts/*` をローカルの既知良好コピー
+（`build/` 以下 + `downloads/` の公式リリース）とハッシュ照合して確認した：
+
+```
+ESP files checked: 127
+not matching ANY local copy: 1
+  856a9044043ac1ed  BOOT/Kexts/VirtualSMC.kext/Contents/MacOS/VirtualSMC
+```
+
+**127 個中 126 個はバイト一致。破損はこの 1 ファイルだけ。**
+`config*.plist` 7 個も `plutil -lint` 全部 OK（`config-vesa.plist` の OC/BOOT 差分は
+壊れではなく、単に古い実験用変種が残っているだけ）。
+
+### 修正
+
+公式リリースのバイナリを `EFI/BOOT/Kexts/VirtualSMC.kext/Contents/MacOS/VirtualSMC`
+に上書きし、`865f736ae87654ee…` で OC 側と一致することを確認。壊れていた方は
+フォレンジック用に `backup/esp-corruption-20260818/VirtualSMC.BOOT.corrupt`
+（SHA256 `856a9044043ac1ed2a3e87c4bf71e7ce56adc539464bb9d003ebc9e03b5fa08f`）へ退避し、
+ESP からは削除した（kext バンドルの中に余計なファイルを置いたままにしない）。
+
+### 原因の見当と、今後の運用
+
+FAT32 はジャーナルを持たない。このマシンは**発見 10 の黒画面のせいで電源ボタン強制断を
+何十回もやっている**ので、その中の一回が、書き込み途中の ESP のクラスタを飛ばしたと
+考えるのが自然。断定はできないが、ESP は書き込み後に必ず
+
+```
+diskutil unmount disk0s5
+```
+
+してマウントしっぱなしにしないこと。マウントされた FAT を抱えたまま電源を落とすのが
+一番危ない。
+
+**そして重要なのは、この破損は 1 バイトも症状を出さなかったという点。** ESP 上の
+ブートローダとカーネル拡張は、ローカルの既知良好コピーとハッシュ照合しない限り
+壊れているかどうか分からない。今後 ESP を触ったら上の 127 ファイル照合を回すこと。
+
+---
+
+## 補足: トラックパッドは実機で動作確認済み（ドライバ側の裏も取れた）
+
+ユーザーが実機で確認、ポインタが動く。ドライバ側の裏付けも取れた：
+
+- `VoodooI2CNativeEngine` が `IOMatchedAtBoot = Yes` で起動時にマッチ
+- その上に `VoodooInput`（`me.kishorprins.VoodooInput`）が `IOPropertyMatch
+  {"VoodooInputSupported"=Yes}` で乗っている
+- デジタイザの実寸をデバイスから読めている:
+  `Physical Max X = 10750` / `Physical Max Y = 7140`（= 107.5 × 71.4 mm、
+  Blade Stealth 13 のタッチパッド実寸と一致）、
+  `Logical Max X = 1291` / `Logical Max Y = 857`
+- `VendorID = 1739`（0x06CB = Synaptics）、`ProductID = 52643`
+- `com.apple.AppleMultitouchTrackpad` の設定ドメインが生成済み（`version = 12`、
+  4本指・5本指ジェスチャのキーまで揃っている）→ macOS が**本物の
+  Apple 式マルチタッチトラックパッドとして扱っている**
+
+### ただし既定値が macOS の初期値のまま
+
+```
+Clicking = 0                 ← タップでクリックが OFF（物理押し込みのみ）
+Dragging = 0
+TrackpadThreeFingerDrag = 0
+TrackpadThreeFingerTapGesture = 0
+ActuationStrength = 0        ← クリック音なし
+USBMouseStopsTrackpad = 0
+```
+
+`Clicking = 0` は Apple の実機と同じ初期値なので不具合ではないが、日常使いでは
+システム設定 > トラックパッド でオンにしたくなるはず。
