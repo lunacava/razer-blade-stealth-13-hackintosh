@@ -1972,3 +1972,112 @@ IOHIDSystem (user client あり)
 
 `diskutil mount disk0s5` でユーザー `hiroki` のまま read-write でマウントできる。
 sudo パスワードが要らないので、以後の ESP 更新はこの手順でよい。
+
+---
+
+## ★★★ 発見 19: `SSDT-DGPU-OFF` は最初から一度も動いていなかった（`_STA = Zero` が `_INI` を殺す）
+
+「dGPU を切ったはずなのに MX150 がまだ列挙される」の原因が判明した。**私の SSDT の
+バグ。** ACPI の仕様に真っ向から反する書き方をしていた。
+
+### 症状
+
+`SSDT-DGPU-OFF.aml` は正しくロードされている。OpenCore のログにも入っている：
+
+```
+00:840  OCA: Inserted table SSDT (54445353) (OEM 0046464F55504744) of 365 bytes into ACPI at index 31
+```
+
+`0046464F55504744` = `D G P U O F F \0`。ベンダ側の SSDT も揃っている
+（index 22 = `SgRpSsdt`、index 24 = `OptTabl`）ので、`_OFF` / `HGOF` は存在する。
+
+なのに dGPU は生きている：
+
+```
++-o GFX0@0  <class IOPCIDevice, registered, matched, active>
+    "compatible"  = <"pci1a58,1000","pci10de,1d10","pciclass,030200","PEGP","GFX0">
+    "acpi-path"   = "IOACPIPlane:/_SB/PCI0@0/RP05@1c0004/PEGP@0"
+    "IOPowerManagement" = {"CurrentPowerState"=2,"MaxPowerState"=3}
+    └ IONDRVFramebuffer     ← フレームバッファまで生えている
+```
+
+そして決定的な手がかり:
+
+```
+$ ioreg -p IODeviceTree -l -w0 | grep -c RZDX
+0
+```
+
+トリガー用に置いた `\_SB.RZDX` がデバイスツリーに存在しない。
+
+### 原因
+
+```asl
+Device (\_SB.RZDX)
+{
+    Name (_HID, "RZDX0001")
+    Name (_STA, Zero)          /* invisible to the OS; only _INI matters */
+    Method (_INI, 0, NotSerialized) { \_SB.RZDG () }
+}
+```
+
+このコメントの理屈が**完全に逆**だった。`_STA` が「非存在」を返すデバイスの `_INI` は
+**そもそも評価されない**。ACPI 仕様の `_INI` の説明（ACPICA `nsinit.c` の
+`AcpiNsInitOneDevice()` が仕様をそのまま引用している。Apple の
+`AppleACPIPlatform` もこの系譜のコード）:
+
+> "If the _STA method indicates that the device is not present, OSPM will not
+> run the _INI and will not examine the children of the device for _INI methods"
+
+実装もそのとおりで、`_STA` のビット 0（present）とビット 3（functioning）が
+両方落ちていると `AE_CTRL_DEPTH` を返してサブツリーの走査を打ち切る:
+
+```c
+if (!(Flags & ACPI_STA_DEVICE_PRESENT)) {
+    if (Flags & ACPI_STA_DEVICE_FUNCTIONING) {
+        /* not present but functioning: _INI は走らせないが子は見る */
+        return_ACPI_STATUS (AE_OK);
+    } else {
+        /* not present かつ not functioning: 子も見ない */
+        return_ACPI_STATUS (AE_CTRL_DEPTH);
+    }
+}
+/* ここまで来たら _INI を実行 */
+```
+
+`Zero` は present も functioning も落ちているので後者。**`RZDG()` は一度も
+呼ばれていない。** ioreg に `RZDX` が無いのはその走査打ち切りの跡である。
+
+### 修正
+
+`_STA` を `0x0B`（present | enabled | functioning、"show in UI" の 0x04 のみ落とす）
+にした。present が立っていれば `_INI` は走る。`_HID` `RZDX0001` に対応する
+ドライバは macOS に無いので、ノードが見えても何も起きない。
+
+```asl
+    Name (_STA, 0x0B)
+```
+
+`iasl` で再コンパイル: 365 → **366 バイト**、
+SHA256 `83c0a9eb623ba0bc1a59b87b94eb12096254aa1ed9222cea1ef911c709428599`。
+`EFI/OC/ACPI/` と **`EFI/BOOT/ACPI/`（起動するのはこっち、発見 17 参照）** の両方に配置。
+旧版は同じディレクトリに `SSDT-DGPU-OFF.aml.sta0` として残してある。
+
+### 次の起動で見るべきこと
+
+| 観測 | 意味 |
+|---|---|
+| `ioreg -p IODeviceTree \| grep RZDX` が**当たる** | `_STA` 修正が効き、namespace 走査が RZDX に到達した |
+| `GFX0@0` / `pci10de,1d10` が**消える** | ベンダ `_OFF` が成功し dGPU が電源から落ちた（成功） |
+| RZDX は出るが GFX0 も残る | `_INI` は走ったが `_OFF` が効かない別問題。`RZOF` のフォールバック `HGOF` 側を疑う |
+
+### 教訓
+
+ダミーデバイスで `_INI` を撃つパターンでは **`_STA` を書かない**か、書くなら
+present を立てる。`_STA = Zero` は「OS から隠す」ではなく「この枝を見るな」であり、
+自分が仕込んだフックごと捨てられる。
+
+**この手のバグは無症状で潜る。** SSDT がロードされていることと、その中身が
+実行されたことは別問題で、OpenCore のログは前者しか教えてくれない。今後 SSDT を
+足すときは、効果そのものを ioreg で確認できる観測点（今回なら `RZDX` ノードの有無）を
+必ず用意すること。

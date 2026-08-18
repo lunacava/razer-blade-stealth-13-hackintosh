@@ -76,11 +76,36 @@ DefinitionBlock ("", "SSDT", 2, "RZRMAC", "DGPUOFF", 0x00000000)
     }
 
     /* Boot-time trigger. A Device with _INI fires once during ACPI
-       namespace initialisation, after PCI0 is up. */
+       namespace initialisation, after PCI0 is up.
+     *
+     * ★ _STA MUST REPORT THE DEVICE PRESENT.
+     *
+     * The first version of this SSDT had `Name (_STA, Zero)` here, reasoning
+     * that the device should be invisible to the OS since only _INI matters.
+     * That is exactly backwards and it silently disabled this whole SSDT for
+     * months: a device that reports not-present never gets its _INI run.
+     *
+     * ACPI spec, description of _INI (quoted from ACPICA nsinit.c, which is
+     * the code Apple's AppleACPIPlatform is derived from):
+     *
+     *   "If the _STA method indicates that the device is not present, OSPM
+     *    will not run the _INI and will not examine the children of the
+     *    device for _INI methods"
+     *
+     * AcpiNsInitOneDevice() returns AE_CTRL_DEPTH for _STA == 0 and aborts
+     * the subtree walk before reaching _INI. Confirmed on this machine:
+     * `ioreg -p IODeviceTree | grep RZDX` found nothing and the MX150 stayed
+     * enumerated as GFX0@0 (pci10de,1d10) at CurrentPowerState 2, with
+     * IONDRVFramebuffer even attached to it.
+     *
+     * 0x0B = present | enabled | functioning, with "show in UI" (0x04)
+     * cleared. Present is what makes _INI run; the OS finds no driver for
+     * _HID RZDX0001 and leaves the node alone.
+     */
     Device (\_SB.RZDX)
     {
         Name (_HID, "RZDX0001")
-        Name (_STA, Zero)          /* invisible to the OS; only _INI matters */
+        Name (_STA, 0x0B)
         Method (_INI, 0, NotSerialized)
         {
             \_SB.RZDG ()
