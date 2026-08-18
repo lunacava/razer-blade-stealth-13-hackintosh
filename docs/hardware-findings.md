@@ -1635,6 +1635,101 @@ WEG が AUX 読み出しをフックした後に `GetDPCDInfo` がダンプを�
 同じ根本原因の別症状だった可能性がある。外して試す価値はあるが、
 失敗モードが起動パニックなので、他の変更と混ぜず、revert スクリプトを用意して単独で行う。
 
+## ★★ 発見 10b: S3 システムスリープは動く。ただし XDCI が 1 秒後に dark wake する
+
+2026-08-18 21:44、`framebuffer-camellia = 0` を入れた状態で S3 を初めて通した。
+`pmset sleep 0` が止めるのは**アイドル**スリープだけなので、
+設定を変えずに 🍎 メニューから明示的にスリープすれば発動する。
+
+### 結果: スリープも復帰も成功した（再起動もパニックも無し）
+
+```
+21:44:16.734  PMRD: tellChangeDown ON_STATE->SLEEP_STATE
+21:44:16.738  PMRD: sleep factors 0x2208c6, LidOpen, ACPower, StandbyDisabled,
+                    USBExternalDevice, RTCAlarmScheduled, AutoPowerOffDisabled,
+                    LocalUserActivity
+21:44:16.802  PMRD: hibernateMode 0x0          <- hibernatemode 0 が効いている
+21:44:17.155  PMRD: === FINISH (ON_STATE->SLEEP_STATE, 9->0, 0x40c2)
+21:44:17.155  PMRD: System Sleep               <- ★ 本当に S3 に入った
+21:44:17.161  PMRD: evaluateSystemSleepPolicyFinal
+21:44:17.162  PMRD: trace point 0x19           <- CPU が止まる直前の最後の記録
+
+21:44:18.189  AppleACPIPlatformPower Wake reason: XDCI    <- ⚠ 1.03 秒後
+21:44:18.189  PMRD: trace point 0x23
+21:44:18.199  PMRD: trace point 0x22
+      ... 7.8 秒、dark wake のまま何も起きない ...
+21:44:26.000  PMRD: System Wake
+21:44:26.000  PMRD: Clamshell opened / display wrangler tickled
+21:44:26.000  PMRD: Requesting full wake due to dark wake activity tickle
+21:44:26.000  PMRD: full wake request (reason 1) 0 ms
+```
+
+**これは発見 2 / 発見 5 の「スリープ復帰で画面が壊れて再起動が必要」が
+解消されたことを意味する。** 画面は戻り、`boottime` は不変（19:17:47）で
+再起動していない。`RWAK` LIDS パッチ（offset `0x16796`）とパネル修正が
+揃って初めて S3 が通った。
+
+### 見つかった問題: `Wake reason: XDCI`
+
+`XDCI` は USB のデバイス側コントローラ（USB OTG / device mode）で、
+macOS では一切使わない。状況:
+
+- ACPI 名前空間には `XDCI` が**存在する**（`ioreg -p IODeviceTree` で 2 件）
+- しかし **PCI 側 14.1 にデバイスは列挙されていない**
+  （`ioreg -c IOPCIDevice` に `XDCI` / `pci8086,a36e` は無し）
+
+つまり **誰も使っていないデバイスの `_PRW` が wake GPE を張っていて、
+それが即座に発火している**、という典型パターン。
+
+### ただし「致命的かどうか」はまだ判定できない
+
+XDCI が起こしたのは **full wake ではなく dark wake** である。
+そして dark wake のまま 7.8 秒座っていたのは、**`sleep 0` のままなので
+二度寝するアイドルタイマーが存在しなかった**から。
+完全復帰させたのは XDCI ではなく**ユーザの操作**である
+（`Clamshell opened` → `display wrangler tickled` →
+`Requesting full wake due to dark wake activity tickle`）。
+
+したがって観測された「8 秒間 dark wake」は **`sleep 0` のアーティファクト**で、
+XDCI の罪ではない可能性がある。判定するにはアイドルスリープを有効にして、
+dark wake の後に自力で二度寝するかを見る必要がある:
+
+```bash
+sudo pmset -c sleep 20 -b sleep 10
+sudo pmset -a ttyskeepawake 0     # SSH セッションがアイドルスリープを阻害しないように
+```
+
+- 二度寝する → XDCI は無害。放置してよい。
+- ping-pong する → DSDT 側で `XDCI._PRW` を潰す必要がある
+  （`_PRW` → `XPRW` のリネームが最小侵襲。`_STA` を 0 にするより副作用が小さい。
+  OpenCore の `ACPI > Patch` で `_OSI`→`XOSI` と同じパターン）。
+
+### 参考: スリープ時の USB カーネルアサーション
+
+`sleep factors` に `USBExternalDevice` が立っている。実際に 4 件:
+
+```
+id=500  owner=GesturePoint Mouse Dongle      (com.apple.usb.externaldevice.14200000)
+id=501  owner=USB2.1 Hub                     (...14300000)
+id=503  owner=USB3.1 Hub                     (...14900000)
+id=505  owner=AX88179A                       (...14940000)
+```
+
+`AX88179A` は SSH に使っている USB Ethernet 自身。これらはスリープを
+禁止してはいないが、スリープポリシー評価に影響する。
+
+### 注意: `MaintenanceWakeCalendarDate`
+
+```
+21:44:16.733  PMRD: MaintenanceWakeCalendarDate 2026/08/18 14:44:14
+21:44:16.733  PMRD: next alarm (MaintenanceWakeCalendarDate) 2026/08/18 14:44:14
+21:44:16.733  PMRD: scheduled alarm mask 0x4
+```
+
+14:44:14 UTC = 2 時間先の RTC アラーム。`sleep factors` の
+`RTCAlarmScheduled` はこれ。1 秒後の wake の原因ではない。
+`powernap 0` にしたので今後は減るはず。
+
 ## ★ 発見 11: 内蔵カメラは動作している（2026-08-18 確認）
 
 Reddit 報告では未確認扱いだった内蔵 Web カメラを、実機ログで確認した。
