@@ -171,7 +171,20 @@ TB3 xHCI (59:00.0) は別コントローラ。USBMap は macOS 上で実施が�
 #### macOS 側から見たポート番号（2026-08-18 実測、USBMap 未実施の素の状態）
 
 コントローラは `XHC@14000000`（`AppleIntelCNLUSBXHCI`、locationID 335544320）**1つだけ**。
-TB3 側の xHCI は Thunderbolt を Block しているため列挙されない。
+**訂正:** ここには「TB3 側の xHCI は Thunderbolt を Block しているため列挙されない」と
+書いてあったが**誤り**。Block しているのは `IOThunderboltFamily` /
+`AppleThunderboltNHI` であり、TB3 の xHCI 機能は別の PCI デバイスとして
+`AppleUSBXHCIAR` が掴む。実測（2026-08-18）:
+
+```
+system_profiler SPUSBDataType:
+  USB 3.1 Bus  Host Controller Driver: AppleUSBXHCIAR        PCI Device ID: 0x15db   ← RP09@1D 配下
+  USB 3.1 Bus  Host Controller Driver: AppleIntelCNLUSBXHCI  PCI Device ID: 0x9ded   ← XHC@14
+```
+
+`AppleUSBXHCIAR` 配下は 4 ポート（`port` = 1, 2 が HS、3, 4 が SS）で、`UsbConnector`
+プロパティは**付いていない**（マップしていないので素のまま）。マップしていない
+コントローラは USBToolBox が触らないため、ポートは無効化されず普通に使える。
 
 | ノード名 | `port` | locationID | VID:PID | デバイス | 内蔵/外付 |
 |---|---|---|---|---|---|
@@ -1766,8 +1779,17 @@ kext が当たらず無言で効かない**ので、名前依存であること�
 ### 未対応として明示しておく箇所
 
 **TB3 コントローラ（`8086:15DB`、ACPI `RP09/PXSX`、4 ポート）はマップしていない。**
-`IOThunderboltFamily` を Block しているうちは macOS から見えないため。Block を
-外すなら、このコントローラ用の personality を別途作る必要がある。
+
+当初ここには「`IOThunderboltFamily` を Block しているうちは macOS から見えないため」と
+書いたが**誤り**だった。適用後の実測で、このコントローラは `AppleUSBXHCIAR` として
+**macOS からちゃんと見えており、4 ポート（`port` = 1, 2, 3, 4）を持っている**ことが
+分かった。Block しているのは Thunderbolt のトンネル側（`IOThunderboltFamily` /
+`AppleThunderboltNHI`）だけで、xHCI 機能は別 PCI デバイスとして生きている。
+
+マップしていないコントローラは USBToolBox が一切触らないので、これらのポートは
+無効化されず素のまま動く（`UsbConnector` プロパティも付かない）。つまり実害はないが、
+**このマシンの USB-C ポートのうち TB3 側は型付けされないまま**である。型付けしたく
+なったら、Windows で `8086:15db` 側のポートも `selected` にして personality を追加すること。
 
 ### 番号体系は ioreg で照合済み
 
@@ -1879,3 +1901,74 @@ SHA256 `7399663c3aa00ba92a3e923670bcc6b39a7208f741b3830066d9bd2a9cad937f`）。
 ログは出ていた。`uptime` が 3 分で、直前の macOS セッションは 05:20 から**連続稼働**
 していたので、その間そもそも再起動が無かっただけ。今回の起動で
 `opencore-2026-08-18-162144.txt` が生成されている。
+
+---
+
+## ★★ 発見 18: USB ポートマップは実機で検証済み（2026-08-18 17:00-17:05）
+
+`EFI/BOOT/Kexts` にもコピーして再起動したら通った。**マップは意図通りに効いている。**
+
+### ioreg の実測（9 ポート、期待値と完全一致）
+
+```
+node   port UsbConn  class                  device
+HS01      1       9  AppleUSB20XHCIPort
+HS02      2       3  AppleUSB20XHCIPort     GesturePoint Mouse Dongle 0x214e:0x0004
+HS03      3       3  AppleUSB20XHCIPort     USB2.1 Hub 0x05e3:0x0610
+HS04      6     255  AppleUSB20XHCIPort     Integrated Camera 0x13d3:0x56d5
+HS05      8     255  AppleUSB20XHCIPort     Razer Blade 0x1532:0x0239
+HS06     10     255  AppleUSB20XHCIPort     Bluetooth USB Host Controller 0x8087:0x0aaa
+SS01     13       9  AppleUSB30XHCIPort
+SS02     14       3  AppleUSB30XHCIPort
+SS03     15       3  AppleUSB30XHCIPort     USB3.1 Hub 0x05e3:0x0626
+port node count: 9
+```
+
+- ポート 7 / 9 / 16 は消えた（マップに載せていないポートは無効化される、の実証）
+- 外部 USB-A は `255 → 3` に矯正された（これがこのマップの実質的な成果）
+- Type-C の `9` は 1 / 13 とも維持
+- `com.dhinakg.USBToolBox.kext (1.2.0)` がロード済み
+
+### 適用後のハードウェア健全性
+
+| 項目 | 結果 |
+|---|---|
+| 内蔵カメラ | `UVC Camera VendorID_5075 ProductID_22229`、Unique ID `0x1440000013d356d5`、480 Mb/s |
+| Bluetooth | State On / Transport USB |
+| en0 (Wi-Fi) | UP / RUNNING |
+| en1 (USB Ethernet AX88179A `0b95:1790`) | UP / RUNNING、**5 Gb/s** |
+| USB3.1 Hub `05e3:0626` | **5 Gb/s** |
+| USB 関連エラーログ | なし |
+
+SS 側が 5 Gb/s でリンクしているので、`UsbConnector 3` を付けたことで USB3 が
+落ちるといった副作用は起きていない。
+
+### トラックパッドのスタックも完備を確認
+
+```
+TPD0 <VoodooI2CDeviceNub>
+ └ VoodooI2CHIDDevice
+    └ IOHIDInterface
+       └ VoodooI2CPrecisionTouchpadHIDEventDriver
+          └ VoodooI2CMultitouchInterface  (AppleMultitouchDeviceUserClient)
+          └ VoodooInputActuatorDevice
+             └ AppleActuatorHIDEventDriver → AppleActuatorDevice
+                → AppleActuatorDeviceUserClient
+ └ TrackpointDevice → IOHIDPointingEventDevice → IOHIDEventDriver
+IOHIDSystem (user client あり)
+```
+
+ハプティックまで含めて全段つながっている。ただし**外付けの GesturePoint マウス
+ドングルが刺さっているので、ポインタが動いていてもそれがトラックパッド由来とは
+限らない。** 人間がトラックパッドだけを触って確認する必要がある（未確認事項）。
+
+### 副産物: `AllowSetDefault` は既に True
+
+`Misc > Boot > AllowSetDefault` と `Misc > Security > AllowSetDefault` は両方
+`True`（Timeout 8、ShowPicker True、PollAppleHotKeys True、HideAuxiliary False）。
+ピッカーで macOS を既定にするのは **Ctrl+Enter を押すだけ**で、config の変更は不要。
+
+### 副産物: OCESP は sudo 無しでマウントできる
+
+`diskutil mount disk0s5` でユーザー `hiroki` のまま read-write でマウントできる。
+sudo パスワードが要らないので、以後の ESP 更新はこの手順でよい。
