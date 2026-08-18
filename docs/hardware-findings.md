@@ -2705,6 +2705,34 @@ USBMouseStopsTrackpad = 0
 `Clicking = 0` は Apple の実機と同じ初期値なので不具合ではないが、日常使いでは
 システム設定 > トラックパッド でオンにしたくなるはず。
 
+### ★ 深く押し込んだクリックが通らない → Force Click を切る（2026-08-18 22:40 解決）
+
+「物理的に深く押し込んだとき、軽くタップしたのと同じようにクリックとして
+認識してほしい」という症状。原因は **Force Click（強めのクリック）が有効**だったこと。
+
+VoodooInput は Magic Trackpad 2 としてエミュレートするので、macOS は圧力を
+解釈して「第 2 ディテント到達 = Force Click」と判定し、通常クリックではなく
+辞書引き / QuickLook 側の動作へ回す。**この機械には圧力センサも触覚エンジンも
+無いので、この解釈は常に誤り。**
+
+```bash
+defaults write com.apple.AppleMultitouchTrackpad ForceSuppressed -bool true
+defaults write com.apple.AppleMultitouchTrackpad ActuateDetents -int 0
+defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad ForceSuppressed -bool true
+defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad ActuateDetents -int 0
+defaults write -g com.apple.trackpad.forceClick -bool false
+```
+
+| キー | 前 | 後 |
+|---|---|---|
+| `ForceSuppressed` | 0 | **1** |
+| `ActuateDetents` | 1 | **0** |
+| `com.apple.trackpad.forceClick` | 1 | **0** |
+
+実機で確認済み。GUI では システム設定 > トラックパッド >
+「強めのクリックと触覚フィードバック」のチェックを外すのと同じ。
+元の値に戻すだけで完全に可逆。
+
 ---
 
 ## ★★ 発見 21: CPU 電力管理の実測 — XCPM は正常、ただし単スレッドが 4.1 GHz で天井
@@ -2877,3 +2905,148 @@ USB Ethernet + xHCI + PCIe リンクがアクティブなだけで深いパッ�
 
 （参考: 測定時の `Boot arguments: -v debug=0x100 keepsyms=1 alcid=30 -igfxblt
 -btlfxboardid` / `EFI version: 2094.80.5.0.0`）
+
+---
+
+## ★★ 発見 22: 輝度キーは「キーが死んでいる」のではなく macOS 側に受け手が居ない（2026-08-18 22:40-23:00 解決）
+
+輝度の上下キーが無反応だった。結論から書くと、**キーは完全に正常で標準どおりの
+usage を送っており**、壊れていたのは受け手側。ACPI 経路も `hidutil` も使えず、
+最終的に Consumer usage を拾って `bklt` を叩く 150 行の常駐 (`tools/brtd/`) で解決した。
+
+### 手順1: キーが macOS に届いているのか（`HIDIdleTime` 法）
+
+まず `log stream` で HID イベントを捕まえようとしたが、`kernel` / `WindowServer` /
+`hidd` / `com.apple.iohid` を `--info --debug` で 32 秒張っても**キー押下は 1 行も出ない**。
+動作している音量キーですら 0 ヒットだったので、この計測方法自体が使えないと判断した。
+
+代わりに `IOHIDSystem` の `HIDIdleTime`（HID 入力があるとゼロに戻る）を 0.3 秒間隔で
+ポーリングした。これは権限も特別なツールも要らない。
+
+```
+22:45:35〜47  67.25 → 78.78 s   何も押していない（正常に増加）
+22:45:47      0.12 s            ★ 輝度ダウンを押した瞬間に崩落
+22:45:47〜    0.01〜0.92 s       連打がすべてイベントとして届いている
+```
+
+→ **キーは届いている。** 「EC がキーを出していない」説はこの時点で消えた。
+
+### 手順2: 何の usage を送っているのか（`hidutil` 文字割り当て法）
+
+`ReportDescriptor` を ioreg から取り出して解析すると、Razer Blade キーボード
+(VendorID 5426 = 0x1532, ProductID 569) は 3 インターフェイス構成で、
+インターフェイス 1 が Consumer ページ全域（Usage Min 0x00 〜 Max 0x23C の配列）を
+宣言していた。つまり「送れる能力がある」ことしか分からない。
+
+そこで候補 usage をそれぞれ別の英字に `hidutil` で割り当て、テキストエディットで
+何の文字が出るかで同定した。**この方法の要点は対照実験を混ぜること**:
+動作している音量ダウン (Consumer 0xEA) を `z` に割り当てておけば、
+`z` が出た時点で「再マッピング機構は生きている」が確定し、
+輝度キーで文字が出ない場合の解釈が一意に決まる。
+
+結果は `zba`:
+
+| 押したキー | 出た文字 | 正体 |
+|---|---|---|
+| 音量ダウン | `z` | Consumer 0xEA ← **対照実験成功** |
+| 輝度ダウン | `b` | **Consumer 0x70 = Display Brightness Decrement** |
+| 輝度アップ | `a` | **Consumer 0x6F = Display Brightness Increment** |
+
+→ **キーは標準の輝度 usage を正しく送っている。**
+
+### 手順3: 受け手が無いことの確認
+
+**(a) `hidutil` では直せない。** 宛先を AppleVendorTopCase 0x04/0x05 にしても、
+Keyboard F14 にしても `bklt` は 1 も動かなかった。src 側は同じ機構で
+確実に動いている（`z` が出た）ので、**`hidutil` の宛先として輝度アクションは
+生成できない**と結論。判定は動作中の音量キーを輝度宛先に転送して 32 秒間
+`bklt` をポーリングし、値が 0.6000 のまま 74 サンプル動かないことで確定させた。
+
+**(b) ACPI 経路は存在しない。** DSDT（60432 行）を調べると:
+
+- `Method (BRTN, 1, Serialized)` は**定義されているだけで、どこからも呼ばれていない**
+  （`grep BRTN` の結果が定義行 1 件のみ）
+- EC の `_Q13`〜`_Q32` / `_QD1`〜`_QD5` に輝度通知は無い。
+  `Notify(..., 0x86)` は 4 件あるが全部 DPTF 熱制御 (`IETM` / `TPWR`)、
+  `Notify(..., 0x87)` は **0 件**
+
+→ **`BrightnessKeys.kext` を入れても完全に無反応**。これは ACPI notify 0x86/0x87 を
+フックする kext なので、そのイベントが存在しない本機では意味がない。
+**無駄な kext 追加と再起動を 1 回節約できた。**
+
+**(c) 輝度制御そのものは正常。** `IODisplaySetFloatParameter(svc, "bklt", 0.35)` が
+`kr=0x0` を返し、ioreg の `bklt` が 65535 → 22937 に動き、画面も実際に暗くなった。
+`PNLF` は `_STA=11` / `compatible=<"backlight">` で認識済み、`-igfxblt` も効いている。
+つまり土台は完成していて、**足りないのは「キーイベント → この API」の結線だけ**だった。
+
+### 解決: `tools/brtd/`
+
+150 行の C。`IOHIDManager` で Consumer 0x6F/0x70 を拾い、`bklt` を Apple と同じ
+1/16 刻みで動かす。`tools/brtd/install.sh` を**実機で**実行すればビルドから
+LaunchAgent 登録まで済む。
+
+**権限の範囲を意図的に絞ってある。** 入力監視は全キー入力が見える権限なので、
+HID スタックに渡してもらう対象を二重に狭めた:
+
+- `IOHIDManagerSetDeviceMatching` → VendorID 0x1532 のみ（内蔵キーボードだけ）
+- `IOHIDManagerSetInputValueMatching` → UsagePage 0x0C のみ（メディアキーだけ）
+
+文字キーは UsagePage 0x07 なので、**原理的にコールバックへ到達しない**。
+
+### ★ 罠: `IOHIDManagerOpen` は許可が無くても成功を返す
+
+これで 30 分ほど溶かした。TCC（入力監視）が未許可の状態でも:
+
+```
+IOHIDCheckAccess(ListenEvent) = 2   (0=granted 1=denied 2=unknown)
+IOHIDManagerOpen = 0x0 OK
+listening: VendorID 0x1532, UsagePage 0x0c only
+```
+
+**open は通り、値だけが黙って捨てられる。** `IOHIDCheckAccess` も ad-hoc 署名の
+バイナリでは許可後も 2 (unknown) を返し続けるので、**どちらも判定に使えない**。
+唯一信頼できるのは「イベントが実際に来るか」。ここでも対照実験が効く:
+UsagePage 0x0C でフィルタしているので、**動作している音量キーを押せばログに出る**。
+出るなら TCC は通っている、出ないなら通っていない。
+
+なお SSH セッションから起動したプロセスは `0xe00002e2`
+(`kIOReturnNotPermitted`) で明示的に失敗し、許可ダイアログも出せない。
+TCC が許可を与えられるのは GUI（Aqua）セッションだけなので、
+**LaunchAgent を `launchctl bootstrap gui/$(id -u)` で登録する必要がある**。
+許可自体は システム設定 > プライバシーとセキュリティ > 入力監視 で手動投入した。
+
+### 実測（2026-08-18 22:5x）
+
+```
+EVENT page=0x0c usage=0x70 value=1
+brightness 1.0000 -> 0.9375 (kr=0x0)
+EVENT page=0x0c usage=0x70 value=1
+brightness 0.9375 -> 0.8750 (kr=0x0)
+EVENT page=0x0c usage=0x70 value=1
+brightness 0.8750 -> 0.8125 (kr=0x0)
+EVENT page=0x0c usage=0xea value=1        ← 音量ダウン（対照実験）
+```
+
+`bklt` は 53247 / 65535 = 0.8125 で一致。上下どちらも実機で画面が追従することを確認済み。
+
+配列要素由来の `usage=0xffffffff value=112` も同時に届くが、
+判定は `usage == 0x6F / 0x70` で行っているので**1 押下 1 ステップ**になる。
+
+### 未実装 / 既知の限界
+
+- **輝度 OSD（画面中央のインジケータ）は出ない。** 出すには非公開の
+  `DisplayServices` / `CoreDisplay` を叩く必要がある。動作自体には影響しない。
+- Shift+Option の 1/64 微調整は未対応（Apple 実機は対応）。
+- **再ビルドすると ad-hoc 署名の cdhash が変わり、入力監視の許可が失効する。**
+  ビルドし直したらトグルを入れ直すこと。
+- `-v` を付けると Consumer キーの押下がすべて `/tmp/brtd.out` に記録される。
+  切り分けが終わったら外すこと（現在は外してある）。
+
+### 教訓
+
+**「効かない」を「壊れている」と読み替えないこと。** このキーは 3 段階すべてで
+正常だった（EC が出す → HID で届く → 標準の usage である）。
+壊れていたのは 4 段目の受け手だけで、`HIDIdleTime` と文字割り当てという
+権限の要らない 2 つの計測で、そこまで正確に切り分けられた。
+`log show` が空だったのを「イベントが無い」と読んでいたら、
+`BrightnessKeys.kext` を入れて再起動して、また空振りしていた。
