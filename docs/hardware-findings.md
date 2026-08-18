@@ -1440,6 +1440,96 @@ provider から 5 つの `OSNumber` プロパティを読み、`PP_ON_DELAYS` /
 
 判定スクリプトは実機の `~/panelchk.sh`（sudo 不要）。
 
+#### ★★★ 結果: 直った（2026-08-18 21:03）
+
+再起動後（boot 19:17:49）の判定は予測どおり:
+
+| パターン | 修正前 | 修正後 |
+|---|---|---|
+| `IG: TCON` | 2 | **0** ✅ |
+| `Timeout powering` | 7/7 | **0** ✅ |
+| `Override power up delays` | 消灯時に出る | **0** ✅ |
+| Metal / VRAM / 解像度 | Metal 3 / 1536MB / 1080p | 同一（副作用なし） |
+
+そして実際の消灯 → 点灯サイクルが**通った**:
+
+```
+20:58:44.844  hwSetPanelPower (state=0)          <- 消灯要求
+20:58:44.844  hwSetPanelPowerConfig (value=1)
+20:58:44.844  Using the default EDP panel timings
+20:58:45.197  Panel power OFF time was 353 ms    <- OFF 完走
+20:58:45.197  PP_STATUS=0x8000001                <- bit27 = power cycle delay 中、パネル OFF
+
+    ... 4 分 32 秒 消灯したまま ...
+
+21:03:17.334  hwSetPanelPower (state=2)          <- 点灯要求
+21:03:17.334  hwSetPanelPowerConfig (value=1)
+21:03:17.334  Using the default EDP panel timings
+21:03:17.560  Panel power ON time was 225 ms     <- ★ 225 ms で完走
+21:03:17.560  PP_STATUS=0x80000008               <- ★ bit31 = パネル ON、シーケンサ完了
+21:03:17.560  [Transition_wake] FB0 Lighting up display in resume from sleep
+21:03:17.560  [Modeset] Lighting up eDP
+21:03:17.561  [LINK_TRAINING] Running fast link training
+21:03:17.561  [LINK_TRAINING] noLanes=2, ASR=1, downspread=0 BitRate = 10
+21:03:17.561  [LINK_TRAINING] voltage=0, preEmphasis=0
+21:03:17.580  [LINK_TRAINING] laneMask=0xff, laneStatus=0x77
+```
+
+**2.2 秒のタイムアウトが 225 ms の正常完了に置き換わった。**
+そして最も強い証拠が `PP_STATUS=0x80000008` である。
+逆アセンブルから読み取った汎用経路（`0x140aa242`）の成功条件は
+
+```
+PP_STATUS & 0xB0000000 == 0x80000000
+```
+
+で、`0x80000008 & 0xB0000000 = 0x80000000` — **予測した合格条件にビット単位で一致**。
+`Panel power ON time was ...` と `PP_STATUS=...` は、どちらも**それまで一度も
+ログに出たことがない行**である（ベースラインで 0 件）。TCON 経路では
+そこまで到達しないので出るはずがなく、出たこと自体が経路が変わった証拠になる。
+
+`Panel power OFF time was 353 ms` も新規。OFF 側は元々破綻していなかったが、
+完了時間がログに出るようになったのは同じ理由（同じ関数の後段）。
+
+`laneStatus=0x77` が `voltage=0, preEmphasis=0` の**初回**で出ていること、
+かつ今回は**視覚的に画面が戻ったことをユーザが確認している**点が重要。
+過去に `0x77` を「成功」と誤読した反省（発見 10 の撤回節）を踏まえ、
+ログではなく実際の表示で判定した。
+
+**副産物: 「消灯時間依存」仮説は完全に死んだ。** 今回消灯していたのは
+4 分 32 秒で、過去に「長時間消灯すると戻らない」とされた領域に十分入っている。
+
+残った ERROR 行は modeset 前後の VBlank / flip タイミングのノイズで、
+パネル電源とは無関係:
+
+```
+2 TxnHang1: FB0: IsTransactionComplete called following fakeVBL notification
+1 displayPath is not NULL for index i = 0. continue
+1 Path state is 2
+1 FB0: VBlank Timeout Timer called in 51ms - fTransactionState = 0x0 ... fOnline: 1
+1 FB0: Flip called without enabling VBL
+1 FB0 Not waiting for in set gamma to solid color as path state is not active
+```
+
+**`AAPL00,Panel*` の第 2 ラウンドは不要になった。** `framebuffer-camellia = 0`
+単独で解決したので、パネルタイミングの注入には手を付けない
+（プロパティの仕様は上に記録してあるので、将来必要になれば使える）。
+
+#### 試験手順のメモ（次に同種の試験をするとき用）
+
+- 消灯のトリガは **Ctrl+Shift+電源ボタン**。`pmset displaysleepnow` は root が
+  必要なので、権限付与を最小に保つならキーボード操作の方が良い。
+- 点灯は普通のキー入力 / トラックパッド。
+- `log stream` を `nohup` で回しておくと、画面が真っ暗で SSH が切れても記録が残る。
+  ただし **`log show --last Nm` で後から拾える**ので、監視窓を外しても復旧できる。
+- 遠隔からの復旧手段として、`/etc/sudoers.d/reboot-nopasswd` に
+  `hiroki ALL=(root) NOPASSWD: /sbin/reboot` を 1 行だけ入れた（ユーザ承認済み）。
+  付与範囲は reboot のみ。`osascript` 経由の再起動は
+  **GUI ダイアログに依存するため復旧手段として使えない**（上述）。
+- ssh 越しに `log show --predicate '...'` を渡すときは、
+  `ssh host 'bash -s' <<'EOF' ... EOF` の形にする。
+  シングルクォート内で `\"` をエスケープする書き方は壊れて 0 行になった。
+
 #### 安全上の前提
 
 このパネルは**電源を落とすと戻らない（7/7）**ので、消灯試験は

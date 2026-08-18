@@ -497,13 +497,36 @@ acpi_patch = [
 # It is gated on framebuffer-patch-enable, which is already set above and
 # already proven to work here (stolenmem/fbmem take effect).
 #
-# One variable at a time: camellia alone first.  If the panel still fails to
-# come back, round two is the five AAPL00,Panel* properties
-# (PanelPowerUp / PanelPowerOn / PanelPowerDown / PanelPowerOff in ms, and
-# PanelCycleDelay), which AppleIntelFramebufferController::
-# hwGetPanelTimingProperties() reads off the iGPU node and programs straight
-# into PP_ON_DELAYS / PP_OFF_DELAYS / PP_CONTROL[8:4].  Apple's built-in
-# fallbacks are 12.5 / 210 / 74 / 250 ms with a 500 ms cycle delay.
+# One variable at a time: camellia alone first.  Round two would have been the
+# five AAPL00,Panel* properties (PanelPowerUp / PanelPowerOn / PanelPowerDown /
+# PanelPowerOff in ms, and PanelCycleDelay), which
+# AppleIntelFramebufferController::hwGetPanelTimingProperties() reads off the
+# iGPU node and programs straight into PP_ON_DELAYS / PP_OFF_DELAYS /
+# PP_CONTROL[8:4] (Apple's built-in fallbacks: 12.5 / 210 / 74 / 250 ms with a
+# 500 ms cycle delay).
+#
+# ★ ROUND TWO WAS NOT NEEDED.  camellia alone fixed it, verified on hardware
+# 2026-08-18 21:03 with the user visually confirming the picture came back:
+#
+#   20:58:44.844  hwSetPanelPower (state=0)
+#   20:58:45.197  Panel power OFF time was 353 ms
+#   20:58:45.197  PP_STATUS=0x8000001         <- bit27 cycle delay, panel off
+#        ... dark for 4 min 32 s ...
+#   21:03:17.334  hwSetPanelPower (state=2)
+#   21:03:17.560  Panel power ON time was 225 ms      <- completed, not timed out
+#   21:03:17.560  PP_STATUS=0x80000008        <- bit31 on, sequencer idle
+#   21:03:17.560  [Modeset] Lighting up eDP
+#   21:03:17.580  [LINK_TRAINING] laneStatus=0x77     <- locked, first attempt
+#
+# 0x80000008 & 0xB0000000 == 0x80000000: the exact success condition read out
+# of the generic path at 0x140aa242.  "Panel power ON time" and "PP_STATUS"
+# had never once appeared in this machine's logs before -- the TCON path never
+# reaches them -- so their presence is itself proof the branch changed.
+# IG: TCON went 2 -> 0, Timeout powering went 7/7 -> 0, and acceleration was
+# unaffected (Metal 3, 1536 MB, 1080p60).
+#
+# Note the panel was dark for 4.5 minutes, which also finally kills the old
+# "it only fails after a long time dark" hypothesis.
 # See docs/hardware-findings.md.
 igpu = {
     "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
