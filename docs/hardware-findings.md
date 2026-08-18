@@ -1635,7 +1635,7 @@ WEG が AUX 読み出しをフックした後に `GetDPCDInfo` がダンプを�
 同じ根本原因の別症状だった可能性がある。外して試す価値はあるが、
 失敗モードが起動パニックなので、他の変更と混ぜず、revert スクリプトを用意して単独で行う。
 
-## ★★ 発見 10b: S3 システムスリープは動く。ただし XDCI が 1 秒後に dark wake する
+## ★★ 発見 10b: S3 システムスリープは完全に動く（`Wake reason: XDCI` は誤読だった）
 
 2026-08-18 21:44、`framebuffer-camellia = 0` を入れた状態で S3 を初めて通した。
 `pmset sleep 0` が止めるのは**アイドル**スリープだけなので、
@@ -1669,40 +1669,85 @@ WEG が AUX 読み出しをフックした後に `GetDPCDInfo` がダンプを�
 再起動していない。`RWAK` LIDS パッチ（offset `0x16796`）とパネル修正が
 揃って初めて S3 が通った。
 
-### 見つかった問題: `Wake reason: XDCI`
+### ★ 訂正: `Wake reason: XDCI` は問題ではない（自分の誤読だった）
 
-`XDCI` は USB のデバイス側コントローラ（USB OTG / device mode）で、
-macOS では一切使わない。状況:
+当初これを「XDCI が 1 秒後にマシンを dark wake させている」と読み、
+`XDCI._PRW` を潰す ACPI パッチが必要だと判断した。**これは誤りである。**
+`framebuffer-camellia` の件と同じく、推測ではなく計測で決着させた。
 
-- ACPI 名前空間には `XDCI` が**存在する**（`ioreg -p IODeviceTree` で 2 件）
-- しかし **PCI 側 14.1 にデバイスは列挙されていない**
-  （`ioreg -c IOPCIDevice` に `XDCI` / `pci8086,a36e` は無し）
+**決定的な証拠 1: スリープ中のログは完全に沈黙している。**
+アイドルスリープを有効にして（`sleep 20`/`10`、`ttyskeepawake 0`）
+2 回目のサイクルを取った:
 
-つまり **誰も使っていないデバイスの `_PRW` が wake GPE を張っていて、
-それが即座に発火している**、という典型パターン。
-
-### ただし「致命的かどうか」はまだ判定できない
-
-XDCI が起こしたのは **full wake ではなく dark wake** である。
-そして dark wake のまま 7.8 秒座っていたのは、**`sleep 0` のままなので
-二度寝するアイドルタイマーが存在しなかった**から。
-完全復帰させたのは XDCI ではなく**ユーザの操作**である
-（`Clamshell opened` → `display wrangler tickled` →
-`Requesting full wake due to dark wake activity tickle`）。
-
-したがって観測された「8 秒間 dark wake」は **`sleep 0` のアーティファクト**で、
-XDCI の罪ではない可能性がある。判定するにはアイドルスリープを有効にして、
-dark wake の後に自力で二度寝するかを見る必要がある:
-
-```bash
-sudo pmset -c sleep 20 -b sleep 10
-sudo pmset -a ttyskeepawake 0     # SSH セッションがアイドルスリープを阻害しないように
+```
+22:20:45.658  PMRD: System Sleep
+22:20:45.690  AppleACPIPlatformPower Wake reason: XDCI
+      ... 4 分 12 秒 ...
+22:24:58.003  PMRD: System Wake
 ```
 
-- 二度寝する → XDCI は無害。放置してよい。
-- ping-pong する → DSDT 側で `XDCI._PRW` を潰す必要がある
-  （`_PRW` → `XPRW` のリネームが最小侵襲。`_STA` を 0 にするより副作用が小さい。
-  OpenCore の `ACPI > Patch` で `_OSI`→`XOSI` と同じパターン）。
+この 4 分間のログ行数を数えると **0 行**。
+30 秒バケットで数えると `22:20:4x` から `22:24:5x` へ丸ごと飛んでいる:
+
+```
+2027 22:20:4x
+15478 22:24:5x        <- 間に何も無い
+```
+
+dark wake で起きていたなら、この 4 分間に必ずログが出る。出ていない。
+**マシンは本当に寝ていた。** 1 回目の空白（21:44:18.3〜21:44:25.9）も同様に 0 行。
+
+**決定的な証拠 2: trace point の並びが `Wake reason` の位置を決めている。**
+
+```
+22:20:45.658  PMRD: System Sleep
+22:20:45.690  Wake reason: XDCI
+22:20:45.690  PMRD: trace point 0x23     <- スリープ経路の末尾
+22:20:45.707  PMRD: trace point 0x22     <- 同
+      ... 4 分 12 秒 ...
+22:24:58.003  PMRD: System Wake
+22:24:58.003  PMRD: trace point 0x24     <- ここからウェイク経路
+22:24:58.008  PMRD: trace point 0x25
+22:24:58.014  PMRD: trace point 0x26
+22:24:58.015  PMRD: trace point 0x27 ...
+```
+
+`0x19 → 0x23 → 0x22` はスリープ経路の末尾で、
+ウェイク経路は `0x24` から始まる。
+`Wake reason: XDCI` は `0x23` / `0x22` と**同時刻**、つまり
+**スリープ完了時に「どのデバイスを wake 源として arm したか」を
+記録している行**であって、実際に起きた記録ではない。
+メッセージ文面が "Wake reason" なので誤読しやすいが、位置が答えを決めている。
+
+実際のウェイク源は別の行に、正しいウォールクロック時刻で出る:
+
+```
+22:24:58.721  PMRD: system wake events: XDCI XHC
+```
+
+`XHC` は USB ホストコントローラ。これはユーザがキーを押したことによる
+正当なウェイクである（`Requesting full wake due to dark wake activity tickle`）。
+
+### 結論: S3 は完全に正常。ACPI パッチは不要
+
+- スリープに入る ✅
+- 4 分以上寝続ける ✅（ログ沈黙で確認）
+- キー入力で復帰する ✅
+- 画面が戻る ✅（`framebuffer-camellia` の修正が効いている）
+- 再起動もパニックも無し ✅（`boottime` 不変）
+
+`XDCI` が ACPI 名前空間に居て PCI 14.1 が列挙されていないこと自体は事実だが、
+**害は出ていない**ので触らない。`XDCI._PRW` → `XPRW` のリネームは
+**やる必要が無かった**（必要になったときのために手法だけ記録しておく:
+OpenCore の `ACPI > Patch` で `_OSI`→`XOSI` と同じパターン）。
+
+#### 教訓
+
+ログのメッセージ文面ではなく**前後の trace point / 行数**で判断すること。
+`camelliaVersion` の件では ERROR レベルしか見ていなかったせいで
+真因を長く見落とし、ここでは逆に文面を読んで在りもしない問題を作った。
+**「その時間帯にログが何行出ているか」は、電源管理の判定で最も安いかつ
+最も強い証拠になる。**
 
 ### 参考: スリープ時の USB カーネルアサーション
 
