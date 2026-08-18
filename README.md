@@ -187,19 +187,50 @@ found.*
 
 ## Current state
 
-Working: NVMe, APFS, RTC, EC + battery reporting, Wi-Fi (AirportItlwm), audio
-(AppleALC `alcid=30`), USB Ethernet, I²C trackpad, dual-boot with Windows.
+Daily-driver usable. macOS Sonoma 14.8.9 (23J631), SMBIOS `MacBookPro15,2`,
+OpenCore 1.0.7, BIOS 1.01 (never flashed).
 
-Open / phase 2:
+Boot-args: `-v debug=0x100 keepsyms=1 alcid=30 -igfxblt -btlfxboardid`
 
-- **iGPU acceleration.** Installed with `-igfxvesa` (acceleration disabled
-  entirely). `framebuffer-portcount = 1` is the leading candidate.
-- USB port mapping (USBMap / USBToolBox) — currently unmapped, so the
-  15-port-per-controller kernel limit is not yet respected.
-- CPUFriend + `SSDT-CPUF` for power management.
-- Thunderbolt is currently blocked in ACPI; needs re-testing.
-- Sleep: an `RWAK` patch at offset `0x16796` is identified but not applied.
-- CodecCommander, external display, optional `_WAK` dGPU hook.
+### Working
+
+| Area | Notes |
+|---|---|
+| NVMe / APFS / RTC | Dual-boot with Windows 11 on the same disk |
+| Battery percentage | ECEnabler — the 16-bit EC field is the cause (finding 4) |
+| Wi-Fi | AirportItlwm (native UI). No AirDrop/Handoff/Sidecar — Broadcom-only features |
+| Audio | AppleALC `alcid=30` |
+| Trackpad | VoodooI2C + VoodooI2CHID. Force Click disabled so deep presses register as normal clicks |
+| USB | USBToolBox + UTBMap, 9 ports on `XHC`. External USB-A corrected from `UsbConnector 255` to `3` |
+| **iGPU acceleration** | Metal 3 on UHD 620. Layout `0x3EA50009`, `framebuffer-camellia = 0`, `stolenmem`/`fbmem` in place of a BIOS DVMT mod, `-igfxblt` |
+| **Display sleep** | Works. `-igfxblr` is silently dead on Sonoma; `-igfxblt` is the replacement |
+| **S3 system sleep** | Works on AC and on battery, including with an external display attached. `RWAK` LIDS patch applied at DSDT `0x16796` |
+| **Lid close** | Sleeps. `AppleClamshellCausesSleep` tracks `pmset sleep`, so it reads `No` whenever sleep is disabled |
+| **Brightness keys** | `tools/brtd` — a small LaunchAgent daemon. The keys and their HID usages were fine all along; macOS simply has no handler for Consumer `0x6F`/`0x70` here (finding 22) |
+| **External display** | Left USB-C, 1920x1080@60, 30-bit, extended desktop, survives S3. This is the issue the Reddit report for this exact laptop left open for six years (finding 23) |
+
+### Open / phase 2
+
+- **Right USB-C carries no video**, and that is our own trade-off rather than a
+  fault: its DP alt mode is muxed inside the Alpine Ridge JHL6240, which BIOS
+  `Thunderbolt = Disabled` leaves unpowered. Untested experiment — enable it in
+  BIOS but *keep* the `AppleThunderboltNHI` block, since the old hard reset was
+  NHI allocating DMA rings against a powered-down device. Fully revertible from
+  within BIOS. Would also allow two external displays.
+- Clamshell operation. Measured requirement: AC plus external input, because
+  `PMRD` re-enables clamshell sleep at `ac 0`.
+- Resolutions above 1080p60, and DisplayPort audio.
+- Whether `enable-dpcd-max-link-rate-fix` / `dpcd-max-link-rate` are still
+  needed now that the framebuffer layout is correct. Failure mode is a boot
+  panic, so test alone with a revert script.
+- CodecCommander; optional `_WAK` hook to re-off the dGPU after resume.
+- TB3 xHCI (`8086:15DB`, 4 ports) is deliberately unmapped, so those ports run
+  untyped.
+
+Decided against, with measurements: CPUFriend (finding on the 4.1 GHz
+question), an HDAS→HDEF rename (would break the `CondRefOf HDAS.PS0X` hook),
+`igfxonln=1`, and a `framebuffer-con1/con2-type` patch (the stock DP+DP layout
+already matches — later confirmed by DP coming up with no patch at all).
 
 ## Credits
 
