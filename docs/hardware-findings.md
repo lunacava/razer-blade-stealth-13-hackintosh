@@ -968,13 +968,80 @@ IG:: EnableClocks:12937 PLL successfully enabled
 - アクセラレーションは無傷: Device ID `0x3ea5`、VRAM 1536MB、Metal 3、
   framebuffer 3個、Online: Yes、新規パニックなし。
 
-### 真の支配変数は「消灯していた時間」だった
+### ★★ 2026-08-18 再訂正: 真因は「パネル電源投入のタイムアウト」だった
+
+> **以下の「消灯時間依存」節は撤回された。** 実測で否定されたので、
+> 結論としては読まないこと。残してあるのは、どこで判断を誤ったかの記録のため。
+> 正しい真因はこの節にある。
+
+帰宅した実機を調べたところ、**起動以降のパネル電源投入 7 回が、7 回すべて
+タイムアウトしていた**。これまで一度も見ていなかった ERROR レベルの
+グラフィクスログに出ていた:
+
+```
+  52 [IGFB][ERROR  ] Framebuffer 0 is not enabled yet!
+   7 [IGFB][ERROR  ] hwSetPanelPower : Timeout powering ON the panel!!
+   7 [IGFB][ERROR  ] displayPath is not NULL for index i = 0. continue
+   7 [IGFB][ERROR  ] FB0 Not waiting for in set gamma to solid color as path state is not active
+   6 [IGFB][ERROR  ]  [AGDC] AGDC not registered. Unmanaged display
+   1 [IGFB][ERROR  ] FB0: Flip called without enabling VBL
+   1 [IGFB][ERROR  ] FB0: VBlank Timeout Timer called in 51ms - fOnline: 1
+```
+
+毎回まったく同じ形をしている:
+
+```
+hwSetPanelPower (state=0)                  <- パネル OFF
+hwSetPanelPowerConfig (value=1)
+  ... 4〜6 秒後
+hwSetPanelPower (state=2)                  <- 電源 ON 要求
+  ... 2.20 秒後
+[ERROR] hwSetPanelPower : Timeout powering ON the panel!!
+hwSetPanelPower (state=2)                  <- 再要求（そのまま先へ進む）
+```
+
+タイムアウトまでの時間は 7 回で 2.170 / 2.248 / 2.255 / 2.250 / 2.253 / 2.184 /
+2.197 秒。**固定タイムアウト約 2.2 秒が満了している**のであって、ばらつきのある
+ハードウェア障害ではない。ドライバはパネル電源シーケンサ（`PP_CONTROL` に
+要求を書いて `PP_STATUS` の完了ビットをポーリングする）の完了を待ち、
+それが来ないまま諦めて次の段へ進んでいる。
+
+**起動時だけ映る理由もこれで説明できる。** ブート直後（08:18:55）のログには
+`hwSetPanelPowerConfig` しか無く、`state=0` → `state=2` の電源遷移が存在しない。
+ファームウェアが既に点けたパネルをそのまま引き継ぐので、破綻する経路を通らない。
+
+#### この発見で撤回される、それまでの結論
+
+1. **`laneStatus=0x77` は成功の証拠にならない。**
+   08:29:39 に `0x77` が出たが、画面は戻っていなかった。それ以降 5 時間半
+   リンクトレーニングは一度も走っておらず、帰宅時に見えていた暗いパネルは
+   08:23 から連続して暗かったものである。同じサイクルで
+   `hwSetPanelPower : Timeout` も出ている。**リンクが張れてもパネルの電源が
+   入っていなければ何も映らない。**
+2. **「リトライすれば復帰する」手順は機能しない。** 下に残してある
+   `for n in 1 2 3 4 5; ...` のループは、`laneStatus=0x77` を成功と誤認した
+   前提の上に建てたもので、実機では一度も画面を復帰させていない。
+   「3回目で絵が戻った」という記述はログからの推測で、視覚的に確認されていなかった。
+3. **「消灯時間依存」は支持されない。** 不変なのは消灯時間ではなく
+   「パネル電源投入が必ずタイムアウトする」ことである。テスト A の「成功」も
+   `laneStatus` だけを見た判定であり、視覚確認を伴っていなかった。
+
+#### 実務上の帰結
+
+このパネルは**電源を落とすと必ず戻らない（7/7）。逆に、落とさなければ落ちない。**
+08:29:39 から 14:06 までの 5 時間半、ログにイベントが一切無いのは、
+パネルを消す要因が私のテストコマンド以外に無かったからである。
+最初にユーザが踏んだのもホットコーナーのディスプレイスリープだった。
+
+したがって対策は「復帰させる」ではなく「**消さない**」に一本化する。
+
+#### 撤回済み（記録用）: 当初の「消灯時間依存」実験
 
 システムスリープを無効化した状態（`pmset -a sleep 0`）で、消灯時間だけを変えた対照実験:
 
-| テスト | 消灯時間 | 結果 |
+| テスト | 消灯時間 | 結果（当時の判定） |
 |---|---|---|
-| A | 15 秒 | `laneStatus=0x77` **成功** |
+| A | 15 秒 | `laneStatus=0x77` **成功**（← 視覚未確認。誤判定） |
 | B | 180 秒 | `Failed to fast link train` / `laneStatus=0x7` **黒画面** |
 
 S3 は両方とも介在していない。**途中で「原因は S3 だ」と診断したのは誤りで、
@@ -1007,8 +1074,12 @@ S3 は両方とも介在していない。**途中で「原因は S3 だ」と�
 
 1レーン HBR = 2.7 Gbps では必要な 4.155 Gbps に足りないので、片側だけでは何も映らない。
 
-**ランダムなので、リトライすれば復帰する。** 実測で `0x7` → `0x7` → `0x77` と推移し、
-3回目の `pmset displaysleepnow` + wake で画面が戻った。**これが SSH 越しの緊急復帰手順**:
+> **撤回。** 「ランダムなのでリトライすれば復帰する」と書いていたが、これは誤り。
+> `0x7` → `0x7` → `0x77` という推移は実測どおりだが、`0x77` になっても画面は
+> 戻らなかった（同じサイクルで `hwSetPanelPower : Timeout` が出ている）。
+> 下のループは**実機で一度も画面を復帰させていない**。SSH 越しの復帰手段は
+> 現時点では存在せず、暗くなったら再起動（電源ボタン短押し → クリーン
+> シャットダウン → 電源オン）しかない。記録のために残す:
 
 ```bash
 for n in 1 2 3 4 5; do
@@ -1027,35 +1098,71 @@ voltage=3 / 0x87 まで escalate、それでも毎回 `laneStatus=0`、最後は
 `Link training failed - notifying AGDC to take display offline` /
 `[Modeset] Not successful. Disabling display`。
 
-変更後は短時間消灯なら確実に復帰し、長時間消灯もリトライで復帰する。
-残っているのは**フォールバック経路の欠落**であって、リンクが死んでいるのではない。
+リンク自体は張れる（`0x77` まで行く）。死んでいるのはパネル電源シーケンスであって、
+レイアウト変更はそこには効かない。**ただし変更前の「リンクが全く張れない」状態からは
+確実に一段改善しており、戻す理由は無い。**
 
-#### 現在の実機側の回避策（config ではなくランタイム）
+#### 実機側の回避策（config ではなくランタイム）
+
+対策は「消さない」に一本化する。`caffeinate` は**再起動で消える**ため恒久策にならない。
+`pmset -a` は設定が永続するので、一度実行すれば足りる:
 
 ```bash
-pmset -a sleep 0                                                    # S3 を無効化（要 sudo）
-launchctl submit -l caffeinate.hold -- /usr/bin/caffeinate -d -i     # ディスプレイスリープ自体を抑止
+sudo pmset -a displaysleep 0 sleep 0      # アイドルのディスプレイスリープと S3 を両方封じる
 ```
 
-`caffeinate` は launchd 経由なので SSH 切断後も生き残る。
-**蓋閉じスリープは `caffeinate` では抑止できない。**
+sudo 不要な補助（これも必須。どちらもパネル電源を落とす経路になる）:
 
-#### 次に調べる仮説: パネル電源投入遅延
+```bash
+defaults write com.apple.dock wvous-tr-corner -int 1 && killall Dock   # ホットコーナーの Display Sleep を解除
+defaults -currentHost write com.apple.screensaver idleTime -int 0      # スクリーンセーバを無効化
+```
 
-復帰時のログにこれが出ている:
+2026-08-18 に実機へ適用済み: `wvous-tr-corner` は 10 → 1、`idleTime` は既に 0。
+
+**蓋閉じは別経路で、これらでは抑止できない。** ただし本機は
+`AppleClamshellCausesSleep = No` と報告している（実測未確認）。
+
+#### 真因の詰め方: パネル電源シーケンサ
+
+失敗サイクルのログにこれが出ている:
 
 ```
 Using the default EDP panel timings
 Override power up delays to optimize
+hwSetPanelPower : Timeout powering ON the panel!!
 ```
 
-ドライバがパネル電源投入後の待ち時間を**短縮**している。数秒消えていただけのパネルは
-まだ温まっているので短縮でも間に合うが、数分消えていた冷えたパネルは
-本来の T3/T7 遅延が必要 — これは観測された時間依存性を正確に説明する。**未検証**。
+ドライバはパネル固有のタイミングではなく**プラットフォーム既定の eDP タイミングを
+使い、さらに電源投入遅延を短縮している**。Intel のパネル電源シーケンサは
+`PP_ON_DELAYS` / `PP_OFF_DELAYS` / `PP_DIVISOR`（`PP_DIVISOR` は基準クロックからの
+分周比）で T1〜T12 を刻む。分周比の前提が実機とずれていればシーケンスは
+2.2 秒以内に完了しない。約 2.2 秒でぴたりと揃うタイムアウトは、
+ハードウェア故障よりこの筋を示唆する。
 
-WhateverGreen にこれを操作する手段は無い（`FAQ.IntelHD` に `fast link` の記述なし、
-`-igfx*` boot-arg にも該当なし、`DPCDMaxLinkRateFix` の `ReadAUX` フックが
-書き換えるのは MAX_LINK_RATE (DPCD 0x001) のみ — ソースで確認済み）。
+**WhateverGreen に該当ノブは無い。** 調査結果:
+
+- `framebuffer-featurecontrol-maximumselfrefreshlevel` は**使えない**。
+  `WhateverGreen/kern_igfx.hpp` を読むと、このフィールドは
+  `FramebufferWestmerePatchFlagBits`（第 1 世代 Westmere / Arrandale 専用）の
+  中にあり、CFL には適用されない。`framebuffer-fbccontrol-*` /
+  `framebuffer-featurecontrol-*` 一式が同様に Westmere 限定。
+  → **CFL 向けの PSR / FBC ノブは存在しない。**
+- `enable-backlight-registers-alternative-fix` (`-igfxblt`) は**すでに適用済み**。
+  FAQ の「KBL/CFL の 3 分黒画面問題」節がまさにこの機種クラスの既知バグで、
+  macOS 13.4 以降は旧 `-igfxblr` が効かない（Apple が `WriteRegister32` を
+  インライン化したため）ので `-igfxblt` が正解、という記述と本機の条件は一致する
+  （ドライバ `AppleIntelCFLGraphicsFramebuffer`、Sonoma 14.8.9、WEG 1.7.0、
+  `SSDT-PNLF.aml` 投入済み）。**それでも直っていない。**
+  `-igfxblt` が触るのは PWM 側（`BLC_PWM_*`）で、
+  タイムアウトしているのはパネル電源側（`PP_CONTROL` / `PP_STATUS`）— 別レジスタ。
+- `enable-dbuf-early-optimizer` (`-igfxdbeo`) は ICL 専用。
+  なお `Pipe Underrun` / `DBuf` は本機のログに **0 件**なので、症状も違う。
+
+未試行で残っている手は、別のモバイル 3 コネクタレイアウト
+`0x3E920009` / `0x3E9B0009` を試すこと（プラットフォームデータが別のパネル電源
+遅延を持っている可能性がある）。ただし本命は VBT 側であり、
+WEG のノブでは届かない領域に入っている可能性が高い。
 
 ### 副産物: `dpcd-max-link-rate` の値は「無害な上限」ではない
 
@@ -1192,3 +1299,39 @@ TCC.db は SIP 保護下なので、リモートから `sudo` 無しでは変更
 黒画面バグの最中でもフレームバッファの中身は正常に撮れてしまうし、
 逆にウィンドウが写らないのはアプリの異常ではない。
 リンクトレーニングの成否は `laneStatus` で、カメラの成否は UVC のフレーム数で見る。
+
+---
+
+## ★ 発見 13: SSH 越しの `log show` は zsh の `log` 組み込みに食われる
+
+`ssh host 'log show --last boot ...'` が、エラーも出さず **0 行**を返す。
+grep が何も見つけられないので「そのイベントは起きていない」と誤読する。
+
+原因は zsh に `log` という組み込みコマンドがあること（csh 由来。ログイン中の
+ユーザを表示するもの）。非対話 zsh でも組み込みが優先されるので、
+`/usr/bin/log` は呼ばれない。引数を渡すと `zsh:log:5: too many arguments` になる
+（これも stderr に出るだけで、パイプ先の `wc -l` は 0 を返す）。
+
+```
+# 壊れる
+ssh host 'log show --start "..." | wc -l'        -> 0
+# 正しい
+ssh host '/usr/bin/log show --start "..." | wc -l'  -> 1812091
+```
+
+**この罠のせいで「起動以降リンクトレーニングは一度も走っていない」と誤診断した。**
+実際には 6 回走っていて、うち 4 回が fast link train 失敗、
+7 回すべてでパネル電源投入がタイムアウトしていた（発見 10 の再訂正節）。
+
+あわせて、これまでに踏んだログ読みの罠:
+
+- `log show --last Nm` は**前回の起動まで遡る**ことがある。`kern.boottime` と
+  照合するか `--start` で起動時刻を明示する。
+- 述語 `eventMessage CONTAINS "..."` は **`log show` 自身のコマンドラインが
+  ログに載ったもの**にマッチする。これで「S3 が起きた」という偽陽性を出した。
+- ログの `at 197856915` のような数値は**起動からのマイクロ秒**。
+- `[Modeset] Disabling display for non-camelia fbs` は無害で、
+  `[Modeset] Not successful. Disabling display` とは別物。
+- **ERROR レベルを最初に見ること。** `[IGFB][ERROR ]` で絞れば
+  `hwSetPanelPower : Timeout powering ON the panel!!` が一行で出ていた。
+  LOG レベルの `laneStatus` を延々追う前にこれを見るべきだった。

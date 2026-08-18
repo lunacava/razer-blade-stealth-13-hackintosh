@@ -250,26 +250,70 @@ acpi_patch = [
 # trains the link before macOS starts, so the first screen is inherited and
 # never re-trained.
 #
-# BIG IMPROVEMENT, BUT NOT A COMPLETE FIX.  READ THE WHOLE NOTE BEFORE
-# TRUSTING THIS.
+# THIS LAYOUT DOES NOT FIX THE BLACK-SCREEN-AFTER-DISPLAY-SLEEP BUG.
+# KEEP IT ANYWAY (it fixes a different, real problem -- see below), BUT READ
+# THE WHOLE NOTE BEFORE TRUSTING ANY CLAIM IN IT.
 #
-# An earlier revision of this comment said "CONFIRMED FIXED on hardware,
-# 2026-08-18 07:35-07:37, four consecutive `pmset displaysleepnow` -> wake
-# cycles".  That claim was too strong, and the reason is instructive: all four
-# of those cycles left the panel off for only ~14 seconds.  A later controlled
-# experiment varied nothing but that duration:
-#     TEST A -- display off  15 s -> laneStatus=0x77            SUCCESS
-#     TEST B -- display off 180 s -> "Failed to fast link train",
-#                                     laneStatus=0x7            BLACK SCREEN
-# Both tests ran with system sleep disabled (`pmset -a sleep 0`), so S3 was not
-# involved in either.  (An intermediate diagnosis blamed S3; that was a grep
-# artifact -- the predicate `eventMessage CONTAINS "Entering Sleep state"`
-# matched `log show`'s own command line being logged.  There was no S3.)
+# THE ACTUAL ROOT CAUSE, measured 2026-08-18 14:00-14:10:
 #
-# So the governing variable is HOW LONG THE PANEL STAYS OFF, not whether the
-# machine suspended.  Long-off resumes fail; short-off resumes succeed.
+#     [IGFB][ERROR  ] hwSetPanelPower : Timeout powering ON the panel!!
 #
-# The driver-side defect is visible in one line:
+# Every single panel power-on since boot timed out -- 7 out of 7.  The shape is
+# identical every time:
+#     hwSetPanelPower (state=0)          <- panel off
+#     hwSetPanelPowerConfig (value=1)
+#       ... 4-6 s later
+#     hwSetPanelPower (state=2)          <- request power ON
+#       ... 2.20 s later
+#     [ERROR] hwSetPanelPower : Timeout powering ON the panel!!
+#     hwSetPanelPower (state=2)          <- re-requested, then carries on anyway
+# Time-to-timeout across the 7: 2.170 / 2.248 / 2.255 / 2.250 / 2.253 / 2.184 /
+# 2.197 s.  A fixed ~2.2 s timeout is expiring; this is not jittery hardware.
+# The driver writes the request to the panel power sequencer (PP_CONTROL) and
+# polls PP_STATUS for completion, which never arrives.
+#
+# THAT IS ALSO WHY ONLY THE BOOT SCREEN WORKS.  The boot-time log (08:18:55)
+# contains only hwSetPanelPowerConfig -- there is no state=0 -> state=2
+# transition at all, because firmware already powered the panel and macOS
+# inherits it.  The broken path is never taken until something turns the panel
+# off.
+#
+# So the operative rule for this machine is: THE PANEL NEVER COMES BACK ONCE
+# IT IS POWERED OFF (7/7), AND NEVER DIES IF IT IS NOT.  Between 08:29:39 and
+# 14:06 there were zero graphics events in the log, because nothing except my
+# own test commands was turning the panel off.  The mitigation is therefore
+# "do not let it power off", not "recover it" -- see MITIGATION below.
+#
+# THREE EARLIER CONCLUSIONS IN THIS FILE ARE HEREBY RETRACTED:
+#
+#  1. laneStatus=0x77 IS NOT EVIDENCE OF SUCCESS.  0x77 appeared at 08:29:39 and
+#     the screen did NOT come back; the same cycle also logged the
+#     hwSetPanelPower timeout, and no link training ran for the next 5.5 h.  A
+#     trained link into an unpowered panel shows nothing.
+#  2. THE "RETRY RECOVERS" PROCEDURE DOES NOT WORK.  It was built on reading
+#     0x77 as success and has never restored the picture on hardware.  The
+#     "picture came back on the third cycle" note was inferred from the log, not
+#     observed.  There is currently NO over-SSH recovery; a dark panel needs a
+#     power-button short press (clean shutdown) and a power-on.
+#  3. THE DURATION DEPENDENCE IS NOT SUPPORTED.  TEST A's "success" below was
+#     also a log-only judgement.  What is invariant is the panel power timeout,
+#     not how long the panel was off.  (Retained for the record:
+#         TEST A -- display off  15 s -> laneStatus=0x77   "SUCCESS" (unverified)
+#         TEST B -- display off 180 s -> laneStatus=0x7    BLACK SCREEN
+#     Both ran with `pmset -a sleep 0`, so S3 was not involved in either.  An
+#     intermediate diagnosis blamed S3; that was a grep artifact -- the
+#     predicate `eventMessage CONTAINS "Entering Sleep state"` matched
+#     `log show`'s own command line being logged.  There was no S3.)
+#
+# A METHOD ERROR WORTH KEEPING: the ERROR-level graphics log was never read
+# until the very end.  Filtering on "[IGFB][ERROR" surfaced the true cause in
+# one line.  Hours were spent chasing LOG-level laneStatus values instead.
+# Compounding it, `ssh host 'log show ...'` returns 0 lines silently, because
+# zsh has a `log` builtin that shadows /usr/bin/log -- which is what produced
+# the false "link training never ran this boot" reading.  Always use the
+# absolute path.  See docs/hardware-findings.md finding 13.
+#
+# A separate driver-side defect, still real and still visible in one line:
 #     [LINK_TRAINING] Failed to fast link train, err = 0x0
 # It DETECTS that fast link training failed and then does not fall back to full
 # link training -- it proceeds straight to EnablePipe with a partially trained
@@ -281,34 +325,51 @@ acpi_patch = [
 #     laneStatus=0x07  lane0 only (0x01|0x02|0x04) -> black
 #     laneStatus=0x70  lane1 only (0x10|0x20|0x40) -> black
 # One lane at HBR carries 2.7 Gbps, and this panel needs 4.155 Gbps, so a
-# one-lane link cannot display anything.  Because it is random, RETRYING
-# RECOVERS: an observed sequence was 0x7 -> 0x7 -> 0x77, i.e. the third
-# `pmset displaysleepnow` + wake brought the picture back.  That is the
-# emergency procedure over SSH when the panel is dark.
+# one-lane link cannot display anything.  The lane bits are a correct decode --
+# but see retraction 1 above: even 0x77 shows nothing while the panel power
+# sequence has timed out, so this table cannot be used to judge success.
 #
-# What the layout change genuinely bought, measured, is still large.  Before it
-# the panel was unrecoverable: 8 clock-recovery retries, drive strength escalated
-# to voltage=3 / 0x87, and laneStatus=0 every single time, ending in "Link
-# training failed - notifying AGDC to take display offline" / "[Modeset] Not
-# successful. Disabling display".  After it, short-off resumes always work and
-# long-off resumes are recoverable by retry.  The remaining bug is a missing
-# fallback path, not a dead link.
+# WHY KEEP THIS LAYOUT ANYWAY.  Before it, the link could not be trained at all:
+# 8 clock-recovery retries, drive strength escalated to voltage=3 / 0x87,
+# laneStatus=0 every single time, ending in "Link training failed - notifying
+# AGDC to take display offline" / "[Modeset] Not successful. Disabling display".
+# Now the link reaches 0x77 at voltage=0 on the first attempt.  That is a real
+# improvement to a real defect; it simply is not the defect that blanks the
+# screen.  There is no reason to revert it.
 #
-# CURRENT MITIGATION IN PLACE ON THE MACHINE (not config): display sleep is
-# suppressed entirely with `caffeinate -d -i` held by launchd
-# (`launchctl submit -l caffeinate.hold -- /usr/bin/caffeinate -d -i`), plus
-# `pmset -a sleep 0`.  Lid-close sleep is NOT covered by caffeinate.
+# MITIGATION -- the only thing that actually works: never let the panel power
+# off.  `caffeinate` is NOT adequate because it dies on reboot; `pmset -a`
+# persists, so one invocation is enough:
+#     sudo pmset -a displaysleep 0 sleep 0
+# and two non-sudo paths that also power the panel off must be closed:
+#     defaults write com.apple.dock wvous-tr-corner -int 1 && killall Dock
+#     defaults -currentHost write com.apple.screensaver idleTime -int 0
+# Applied on hardware 2026-08-18: wvous-tr-corner 10 -> 1, idleTime already 0.
+# Lid close is a separate path and none of these cover it, though the machine
+# reports AppleClamshellCausesSleep = No (not verified by experiment).
 #
-# NEXT LEVER TO INVESTIGATE: the resume log shows
-#     Using the default EDP panel timings
-#     Override power up delays to optimize
-# The driver shortens the panel power-up delay.  A panel that has been off for
-# seconds is still warm and trains fine; one off for minutes is cold and needs
-# the full T3/T7 delay before AUX/lane training is reliable.  That hypothesis
-# fits the duration dependence exactly and has not yet been tested.
-# WhateverGreen exposes no knob for this: FAQ.IntelHD never mentions fast link
-# training, no `-igfx*` boot-arg covers it, and DPCDMaxLinkRateFix's ReadAUX
-# hook rewrites only MAX_LINK_RATE (DPCD 0x001).
+# WHERE THE REAL FIX WOULD HAVE TO LIVE, and why WhateverGreen cannot reach it.
+# The failing cycle logs "Using the default EDP panel timings" and "Override
+# power up delays to optimize" just before the timeout: the driver uses
+# platform-default eDP timings and then shortens the power-up delay.  Intel's
+# panel power sequencer clocks T1..T12 out of PP_ON_DELAYS / PP_OFF_DELAYS /
+# PP_DIVISOR, and PP_DIVISOR is a divide-down of the reference clock; if that
+# assumption is wrong for this board the sequence cannot complete inside 2.2 s.
+# Searched for a knob and there is none:
+#   * framebuffer-featurecontrol-maximumselfrefreshlevel is UNUSABLE here.  In
+#     WhateverGreen/kern_igfx.hpp that field lives in
+#     FramebufferWestmerePatchFlagBits -- first-generation (Westmere/Arrandale)
+#     only.  The whole framebuffer-featurecontrol-* / framebuffer-fbccontrol-*
+#     family is Westmere-only, so there is no PSR or FBC knob for CFL at all.
+#   * enable-backlight-registers-alternative-fix (-igfxblt) IS ALREADY APPLIED
+#     (see boot-args below).  The FAQ's "3-minute black screen issue on KBL/CFL"
+#     section matches this machine's conditions exactly -- CFL framebuffer
+#     driver, macOS >= 13.4 so the older -igfxblr is dead, WEG 1.7.0,
+#     SSDT-PNLF.aml injected -- and it still does not fix this.  -igfxblt
+#     rewrites the PWM side (BLC_PWM_*); the timeout is on the panel power side
+#     (PP_CONTROL / PP_STATUS).  Different registers.
+#   * enable-dbuf-early-optimizer (-igfxdbeo) is ICL-only, and this machine logs
+#     zero "Pipe Underrun" / "DBuf" messages, so the symptom does not match.
 #
 # The measurement that produced the original (short-cycle) success reads:
 #     [Modeset] FB0: Complete modeset
@@ -332,19 +393,21 @@ acpi_patch = [
 #     merely tolerable.
 #   * "Failed Phase 1 of Link Training", "Link training failed - notifying
 #     AGDC to take display offline" and "[Modeset] Not successful. Disabling
-#     display" are all absent -- zero occurrences for that whole boot.  Note
-#     that their absence is necessary but NOT sufficient: the long-off failure
-#     mode above also produces none of them, because it fails in fast link
-#     training and never reaches full training.  Always check laneStatus.
+#     display" are all absent -- zero occurrences for that whole boot.  Their
+#     absence proves very little: the failure mode above produces none of them
+#     either, because it fails in fast link training and never reaches full
+#     training -- and the panel-power timeout produces none of them at all.
+#     Read the ERROR-level log ("[IGFB][ERROR"), not the absence of strings.
 #   * BitRate = 10 is decimal for the injected 0x0A, so the DPCD property below
 #     is being honoured at the same time.
 # Acceleration survived the switch: Device ID 0x3ea5, VRAM 1536 MB, Metal 3,
 # 3 framebuffers enumerated, display Online / Main Display Yes, no new panics.
 #
-# Still-open alternatives, since the fix is incomplete: the other two
-# 3-connector mobile layouts 0x3E920009 / 0x3E9B0009 are untried, and the
-# last-resort workaround -- never letting the link drop at all -- is what is
-# actually deployed right now via caffeinate.  See docs/hardware-findings.md.
+# Still untried: the other two 3-connector mobile layouts 0x3E920009 /
+# 0x3E9B0009, on the chance their platform data carries different panel power
+# delays.  That is a long shot -- the likely home of the fix is the VBT, which
+# WhateverGreen's Intel knobs do not reach.  What is actually deployed is the
+# workaround: never power the panel off.  See docs/hardware-findings.md.
 igpu = {
     "AAPL,ig-platform-id":      D("0900A53E"),   # 0x3EA50009, laptop default
     "device-id":                D("A53E0000"),   # 0x3EA5, WHL fake per FAQ
