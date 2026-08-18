@@ -11,7 +11,7 @@
 | CPU | Intel Core i7-8565U (Whiskey Lake-U, CPUID 0x0806E0) |
 | BIOS | **1.01 (2018/11/12)** ← 絶対に更新しない |
 | ACPI OEM | ALASKA / A M I / rev 01072009 |
-| OS | Windows 11 build 26100 |
+| OS | Windows 11 Home build **26200**（2026-08-18 実測。当初 26100 → Windows Update が走った） |
 | 内蔵パネル | DISPLAY\SHP14B8 (Sharp) — "Integrated Monitor" |
 | バッテリー | Razer (serial redacted), Li-Ion, 設計 53,153 mWh / 満充電 52,033 mWh = **劣化 2.1% のみ（極めて良好）** |
 | S3 スリープ | **利用可能**（S0ix は非対応）→ macOS のスリープに好都合 |
@@ -1477,3 +1477,146 @@ $ /tmp/t                            → swift-ok hirokis-macbook-pro.local
 `import Foundation` を含むプログラムがエラーなしで通る。**これで原因の切り分けも裏取りできた**
 （重複 modulemap 1ファイルの除去だけで直った）。以後、macOS 側で小さな検証プログラムを
 書いて実機を調べる手が使える。
+
+## ★★ 発見 15: Windows 起動確認と、その場で見つかった2つの実害（2026-08-18 15:37-15:45）
+
+### まず本題: Windows は OpenCore のピッカーから起動する
+
+config を何度も書き換えた後でも、同一 NVMe 上のデュアルブートは生きている。**実起動で確認済み。**
+
+事前に OpenCore の起動ログ（`Misc > Debug > Target = 67` = 0x43 でファイル出力あり、
+ESP 直下に `opencore-YYYY-MM-DD-HHMMSS.txt`）でエントリ登録も確認していた:
+
+```
+01:247  OCB: Found 11 potentially bootable filesystems
+01:662  OCBP: Predefined \EFI\Microsoft\Boot\bootmgfw.efi was found
+01:672  OCB: Registering entry Windows [Windows] (T:32|F:0|G:0|E:0|B:0)
+        - HD(2,GPT,CA948512-7708-4912-AF47-1065E6D9919F,0x32800,0x32000)
+          /\EFI\Microsoft\Boot\bootmgfw.efi
+04:166  OCB: Should boot from 2. Macintosh HD (T:2|F:0|G:0|E:0|DEF:0)
+```
+
+**副産物: `disk0s2` が macOS からマウントできない件は、OpenCore の障害ではない。**
+上のログの `HD(2)` はまさにその `disk0s2` で、OpenCore は自前の FAT ドライバで
+問題なく読めている。macOS の msdos ドライバ側の癖であって、ESP の破損ではない。
+
+`DEF:0` = デフォルトエントリは未設定（`Ctrl+Enter` での設定は別途）。
+
+起動後の健全性:
+
+| 項目 | 値 | 判定 |
+|---|---|---|
+| OS | Windows 11 Home 10.0.**26200** | 記録は 26100 → **Windows Update が走った** |
+| BIOS | **1.01 / 2018-11-12** | **維持されている（最重要）** |
+| Secure Boot | False | OpenCore に必要、正常 |
+| ディスク | Samsung 970 EVO 1TB, GPT, 7 パーティション | 無傷 |
+| C: | 350.01 GB | 正常 |
+| APFS 領域 | 580.2 GB（Windows からは `Unknown`） | 正常 |
+| OCESP | 0.2 GB（partition 5, `System`） | 正常 |
+
+### 実害 1: Windows の時計が9時間ずれる（RTC の UTC/現地時刻問題）
+
+```
+Windows が表示する現地時刻 : 2026-08-18 06:39   ← 実際は 15:39 JST
+タイムゾーン                : Tokyo Standard Time (UTC+9)   ← 設定は正しい
+RealTimeIsUniversal         : (未設定)                       ← 原因
+w32time                     : Stopped                        ← 自己修復もしない
+```
+
+macOS は RTC を UTC で持つ。Windows は `RealTimeIsUniversal` が無いと **RTC を現地時刻として
+読む**ため、06:39 UTC をそのまま JST として表示する。しかも `w32time` が停止していたので
+NTP でも直らない。**macOS 側は NTP で自動的に直るので、ずれるのは Windows だけ。**
+
+修正（適用済み・検証済み）:
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation" `
+  -Name RealTimeIsUniversal -PropertyType DWord -Value 1 -Force
+Set-Service -Name w32time -StartupType Automatic
+Start-Service -Name w32time
+w32tm /config /syncfromflags:manual /manualpeerlist:"time.windows.com,0x9" /update
+w32tm /resync /force
+```
+
+結果は秒単位で一致:
+
+```
+Windows  : 2026-08-18 15:42:45 JST
+Mac mini : 2026-08-18 15:42:45 JST
+```
+
+**NTP 抜きで直った**（`RealTimeIsUniversal=1` が効いて RTC を UTC として読み直したため）。
+これ自体が切り分けの裏取りになっている。なお最初の `w32tm /resync` は
+「時刻データが利用できなかった」で失敗したが、2回目は exit 0。
+
+### 実害 2: BIOS が Windows Update から配信されうる経路が開いていた
+
+```
+デバイス: System Firmware   UEFI\RES_{2F41F3C2-BB7C-4895-B9CD-621622C4DE2C}\0
+保留中の更新: [Drivers] Intel - System - 3/19/2019 - 1912.12.0.1247
+```
+
+`System Firmware` デバイスの存在は、**UEFI カプセル更新の経路が生きている**という意味。
+「BIOS 1.01 を絶対に維持する」という方針に対する実際のリスクである
+（BIOS 3.02 は複数ユーザで起動不能を招いている）。
+
+#### まず試して不十分だったもの
+
+```powershell
+# HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+ExcludeWUDriversInQualityUpdate = 1
+```
+
+これは**品質更新（毎月の累積更新）にドライバを同梱させない**設定にすぎず、
+ファームウェア更新そのものを禁止しない。適用後も Windows Update の検索 API
+（`IsInstalled=0`）には `[Drivers] Intel - System` が残り続ける。
+ただし**この検索結果は「サーバ上に存在する」ことしか示さない**ので、
+効果判定の道具としても不適切だった。設定自体は有用なので残してある。
+
+#### 実際に効く手段（適用済み）
+
+Firmware デバイスクラスのインストール自体を禁止する。
+
+```powershell
+$FW = "{f2e7dd72-6468-4e36-b6f1-6488f42c1b52}"   # Firmware setup class
+$R  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+New-ItemProperty -Path $R -Name DenyDeviceClasses            -PropertyType DWord -Value 1
+New-ItemProperty -Path $R -Name DenyDeviceClassesRetroactive -PropertyType DWord -Value 0
+New-ItemProperty -Path "$R\DenyDeviceClasses" -Name "1" -PropertyType String -Value $FW
+```
+
+**GUID は推測ではなく実物で確認した:**
+
+```
+HKLM:\SYSTEM\CurrentControlSet\Control\Class\{f2e7dd72-...}  の Class 値 = "Firmware"
+対象デバイス: System Firmware / UEFI\RES_{2F41F3C2-...}\0
+```
+
+`Retroactive = 0` にしてあるので、既にインストール済みのものには触れず、
+**新規のインストール・更新のみを拒否**する。元に戻すには `Restrictions` キーを削除する。
+
+### この3つの設定は「後片付け」の対象ではない
+
+Windows 側の SSH 有効化（`sshd` / `administrators_authorized_keys` /
+ネットワークカテゴリを Private に変更）は作業後に**戻す**対象だが、
+本節の3つのレジストリ設定は**恒久的な修正なので戻さない**。混同しないこと。
+
+| 設定 | 作業後 |
+|---|---|
+| `RealTimeIsUniversal = 1` | **残す** |
+| `ExcludeWUDriversInQualityUpdate = 1` | **残す** |
+| `DeviceInstall\Restrictions`（Firmware クラス拒否） | **残す** |
+| `sshd` 有効化 / `administrators_authorized_keys` / NetworkCategory | 戻す |
+
+### 手法メモ: `bin/rzps` 経由だと Windows のネイティブコマンド出力が化ける
+
+`rzps` は `[Console]::OutputEncoding` を UTF-8 に固定するが、`w32tm` などの
+ネイティブコマンドは OEM コードページ（日本語環境では cp932）でバイトを吐くため、
+UTF-8 として解釈されて文字化けする。
+
+```
+  �R�}���h�͐������������܂����B      ← 実際は「コマンドは正常に完了しました。」
+```
+
+PowerShell のコマンドレット（`Get-CimInstance` 等）の出力は化けない。
+**ネイティブコマンドは出力本文を読まず、`$LASTEXITCODE` で判定するのが確実。**
