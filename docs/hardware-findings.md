@@ -71,7 +71,8 @@ OK     Bluetooth  インテル(R) ワイヤレス Bluetooth(R)  USB\VID_8087&PID
 `Get-PnpDevice -Class USB` で絞ると**漏れる**。この device の Class は `USB` ではなく
 `Bluetooth` だからである。`-Class` で絞らず `InstanceId -match 'VID_8087'` で探すこと。
 
-macOS 側では XHCI の **PortNum 8** に `8087:0AAA` として列挙される。
+macOS 側でも XHCI の **port 10**（ノード `HS10`、Windows の root hub port 10 と同一）に
+`8087:0AAA` として列挙される。
 つまり CNVi の BT は内部的に USB でぶら下がっており、両 OS で見える。そして動作している:
 
 ```
@@ -172,20 +173,41 @@ TB3 xHCI (59:00.0) は別コントローラ。USBMap は macOS 上で実施が�
 コントローラは `XHC@14000000`（`AppleIntelCNLUSBXHCI`、locationID 335544320）**1つだけ**。
 TB3 側の xHCI は Thunderbolt を Block しているため列挙されない。
 
-| PortNum | locationID | VID:PID | デバイス | 内蔵/外付 |
-|---|---|---|---|---|
-| 2 | 337641472 | 214E:0004 | GesturePoint Mouse Dongle | 外付 |
-| 3 | 338690048 | 05E3:0610 | USB2.1 Hub (Genesys) | 外付 |
-| **4** | 339738624 | **13D3:56D5** | **内蔵カメラ** | 内蔵 |
-| **6** | 341835776 | **1532:0239** | **内蔵キーボード + Razer Chroma** | 内蔵 |
-| **8** | 343932928 | **8087:0AAA** | **Intel Bluetooth (CNVi)** | 内蔵 |
-| 11 | 347078656 | 05E3:0626 | USB3.1 Hub (Genesys) → 配下に AX88179A (0B95:1790) | 外付 |
+| ノード名 | `port` | locationID | VID:PID | デバイス | 内蔵/外付 |
+|---|---|---|---|---|---|
+| HS01 | 1 | 0x14100000 | — | （USB-C、未接続） | 外付 |
+| HS02 | 2 | 0x14200000 | 214E:0004 | GesturePoint Mouse Dongle | 外付 |
+| HS03 | 3 | 0x14300000 | 05E3:0610 | USB2.1 Hub (Genesys) | 外付 |
+| HS06 | **6** | 0x14400000 | **13D3:56D5** | **内蔵カメラ** | 内蔵 |
+| HS07 | 7 | 0x14500000 | — | （未使用） | — |
+| HS08 | **8** | 0x14600000 | **1532:0239** | **内蔵キーボード + Razer Chroma** | 内蔵 |
+| HS09 | 9 | 0x14700000 | — | （未使用） | — |
+| HS10 | **10** | 0x14800000 | **8087:0AAA** | **Intel Bluetooth (CNVi)** | 内蔵 |
+| SS01 | 13 | 0x14900000 | — | （USB-C、未接続） | 外付 |
+| SS02 | 14 | 0x14a00000 | — | （USB-A ①、未接続） | 外付 |
+| SS03 | **15** | 0x14b00000 | 05E3:0626 | USB3.1 Hub (Genesys) → 配下に AX88179A (0B95:1790) | 外付 |
+| SS04 | 16 | 0x14c00000 | — | （未使用） | — |
 
-**Windows の HSxx 番号と macOS の PortNum は一致しない。** カメラは Windows で HS06 だが
-macOS では PortNum 4、キーボードは Windows HS08 に対し macOS では 6。
-USB マッピングを実施する理由がまさにこれ。
+#### ★ 訂正: Windows と macOS のポート番号は**一致する**
 
-内蔵は 4 / 6 / 8 の3つで確定。残りは物理ポートで、Ethernet は Genesys ハブ経由。
+ここには以前「Windows の HSxx 番号と macOS の PortNum は一致しない。カメラは Windows で
+HS06 だが macOS では PortNum 4」と書いてあったが、**間違い**だった。読んでいたのは
+`port` ではなく **locationID のニブル**で、あれは macOS が列挙したポートに振り直す
+表示用の詰めた連番にすぎない（HS04/HS05 が存在しないので HS06 が 4 番目になる）。
+
+`ioreg` の **`port` プロパティ**を読むと Windows / ACPI `_ADR` と完全に一致する:
+カメラ = 6、キーボード = 8、Bluetooth = 10、USB3 ハブ = 15。
+DSDT の `Device (RHUB)` 配下も `HS01._ADR = 1` … `HS10._ADR = 0x0A` と名前どおり。
+
+**USB マップに書く番号はこの `port` の体系**で、Windows 側で採取した番号がそのまま使える。
+
+macOS は 18 ポート中 12 ポートだけ列挙する（HS04, HS05, 11, 12, 17, 18 は出ない）ので、
+そもそも 15 ポート制限には当たっていない。また `UsbConnector` は既に `_UPC` から
+読まれており、**port 1 と 13 だけ `9`（Type-C）、他は全部 `255`（内蔵）**。
+つまりマップの実利は「ポート制限の回避」ではなく、**USB-A（2, 3, 14, 15）が内蔵扱い
+`255` になっているのを正しい `3` に直すこと**と、未使用の 7 / 9 / 16 を落とすこと。
+
+内蔵は 6 / 8 / 10 の3つで確定。Ethernet は Genesys ハブ経由（root は port 3 / 15）。
 
 ### Windows 動作が重い原因（仮想デバイスの山）
 Display クラスに実画面以外が2つ、加えて多数の仮想バス:
@@ -1636,9 +1658,14 @@ PowerShell のコマンドレット（`Get-CimInstance` 等）の出力は化け
 
 ## ★★ 発見 16: USB ポートマップ — USBToolBox は `type` ではなく `selected` を見る（2026-08-18 16:05-16:20）
 
-macOS の XHCI は 1 コントローラあたり **15 ポート**までしか受け付けないが、この PCH
-xHCI（`8086:9DED`、ACPI `\_SB.PCI0.XHC`）は **18 ポート**申告する。`XhciPortLimit`
-は Catalina 以前向けの手抜きなので `false` のまま、ポートを明示宣言する方針を採った。
+この PCH xHCI（`8086:9DED`、ACPI `\_SB.PCI0.XHC`）は Windows から見ると **18 ポート**
+申告する。`XhciPortLimit` は Catalina 以前向けの手抜きなので `false` のまま、ポートを
+明示宣言する方針を採った。
+
+**ただし後から実測で判明したとおり、macOS はそのうち 12 ポートしか列挙しないので
+15 ポート制限には当たっていない**（上の「macOS 側から見たポート番号」の表を参照）。
+マップの実利は制限回避ではなく、**外部 USB-A が `UsbConnector 255`（内蔵扱い）に
+なっているのを `3` に直すこと**と、未使用ポートを落とすこと。当初の見込みより効果は小さい。
 
 ### ポート構成は ACPI `_UPC` / `_PLD` から確定した（差し替え実験なしで）
 
@@ -1742,8 +1769,113 @@ kext が当たらず無言で効かない**ので、名前依存であること�
 `IOThunderboltFamily` を Block しているうちは macOS から見えないため。Block を
 外すなら、このコントローラ用の personality を別途作る必要がある。
 
-### 現状: まだ検証していない
+### 番号体系は ioreg で照合済み
 
-ESP への配置は macOS 側からの作業なので、この時点では repo（`build/EFI/`）に
-入れただけ。実機の ioreg で 9 ポートが期待どおり生えるかは未確認。
+マップに書いた 9 個の番号が macOS の `port` プロパティと同じ体系であることは、
+適用前の ioreg で確認した（上の訂正節を参照）。`IONameMatch = "XHC"` も
+`XHC@14` の `compatible = <"pci1a58,1000","pci8086,9ded","pciclass,0c0330","XHC">`
+に含まれるので一致する。
+
 config hash は `5623ac3bf71d6536` → `785d247bb29ba101`。
+
+**なお最初の投入は起動失敗した。原因は kext の内容ではなく置き場所で、発見 17 を参照。**
+
+---
+
+## ★★★ 発見 17: 起動するのは `EFI/BOOT/` 側。`EFI/OC/` だけ更新しても効かない（2026-08-18 16:35-16:50）
+
+USB マップを入れて再起動したら、カーネル読み込み中に止まった。
+
+```
+#[EB.LD.LKC|R.2] <"boot\System\Library\KernelCollections\BootKernelExtensions.kc">
+OC: Plist Kexts\USBToolBox.kext\Contents\Info.plist is missing for injected kext USBToolBox.kext ()
+Halting on critical error
+```
+
+### 原因: この ESP には OpenCore が**二重に**入っている
+
+`EFI/BOOT/` は単なるフォールバックの `BOOTx64.efi` ではなく、**独立した完全な
+OpenCore 一式**だった。
+
+```
+EFI/BOOT/BOOTx64.efi      872448 バイト  ← EFI/BOOT/OpenCore.efi と同一サイズ
+EFI/BOOT/OpenCore.efi     872448
+EFI/BOOT/config.plist                    ← ファームウェアが読むのはこっち
+EFI/BOOT/config-vesa.plist
+EFI/BOOT/ACPI/  Drivers/  Tools/  Resources/  Kexts/   ← 自前の Kexts を持つ
+EFI/OC/OpenCore.efi       872448
+EFI/OC/config.plist
+EFI/OC/ACPI/  Drivers/  Tools/  Resources/  Kexts/
+```
+
+ファームウェアが起動するのは `EFI/BOOT/BOOTx64.efi` なので、**実際に読まれる設定は
+`EFI/BOOT/config.plist`、実際に読まれる kext は `EFI/BOOT/Kexts/`**。
+
+やってしまったのは:
+
+* `config.plist` は `EFI/OC/` と `EFI/BOOT/` の**両方**に置いた
+* kext は `EFI/OC/Kexts/` に**しか**置かなかった
+* → 新しい設定が `USBToolBox.kext` を要求したが、`EFI/BOOT/Kexts/` には無い
+
+エラーのパスが `Kexts\USBToolBox.kext\...` と**相対表記**なので、どちらの `Kexts` を
+見て失敗したのかがログから判別できない。ここが分かりにくい。
+
+### 誤診した仮説（記録として残す）
+
+最初に「FAT への書き込みがディスクに落ちておらず、`shasum` の検証はページキャッシュ
+から返っていた」と考えた。**外れ**。Windows から OCESP を読んだら、ファイルは正しい
+サイズで存在し、SHA256 もローカルと完全一致していた。書き込みは成功しており、
+置き場所が足りなかっただけ。
+
+### 復旧経路: Windows は生きている
+
+**OpenCore は macOS 起動時にしか kext を注入しないので、この halt が起きても Windows
+は普通に起動する。** これが確実な復旧経路になる。もう一つの経路として
+`EFI/OC/Tools/OpenShell.efi` がピッカーに出る設定になっている（`Misc > Tools`、
+Enabled）。
+
+Windows から OCESP を触る手順（`disk0s5`。**`disk0s2` は Windows の SYSTEM なので触らない**）:
+
+```powershell
+# diskpart は使わない（disk0 に Windows も macOS も載っている）。対象限定のコマンドレットだけ。
+Add-PartitionAccessPath    -DiskNumber 0 -PartitionNumber 5 -AccessPath "Z:"
+# ... 作業 ...
+Remove-PartitionAccessPath -DiskNumber 0 -PartitionNumber 5 -AccessPath "Z:"
+```
+
+`Get-Partition -DiskNumber 0` でパーティション番号は GPT の順序と一致する
+（1=Razer Recovery, 2=SYSTEM, 3=MSR, 4=C:, **5=OCESP**, 6=APFS, 7=WinRE）。
+
+### ★ 以後の手順: ESP を更新したら必ず両方に入れ、config が要求する全 kext の実在を確認する
+
+読まれる `EFI/BOOT/config.plist` を parse して、`Kernel > Add` の各エントリの
+`BundlePath` + `PlistPath` / `ExecutablePath` が `EFI/BOOT/Kexts/` に実在するかを
+機械的に検証する。今回の失敗はこれをやっていれば起動前に捕まえられた。
+
+### 両ツリーのドリフト（2026-08-18 実測）
+
+`EFI/OC`（530 ファイル）と `EFI/BOOT`（527 ファイル）を SHA256 で全件突き合わせた結果:
+
+| 差分 | 内容 |
+|---|---|
+| `EFI/OC` のみ | `config-accel.plist` `config-bt.plist` `config-bt2.plist` `config-dpcd0A.plist` `config-fb3EA5.plist`（実験用の変種） |
+| `EFI/BOOT` のみ | `BOOTx64.efi`、`.contentVisibility` |
+| **内容が違う** | `config-vesa.plist`、**`Kexts/VirtualSMC.kext/Contents/MacOS/VirtualSMC`** |
+
+**`VirtualSMC` のバイナリが OC と BOOT で違う。** 動いているのは BOOT 側。正常起動して
+いるので今は触らないが、いつからずれたのか不明であり、今後 VirtualSMC を疑うときは
+BOOT 側を見ること。
+
+### ESP のバックアップ
+
+`backup/ocesp-20260818-1629/ocesp-EFI-backup.tar.gz`（105,914,442 バイト、
+SHA256 `7399663c3aa00ba92a3e923670bcc6b39a7208f741b3830066d9bd2a9cad937f`）。
+`EFI` は 120MB あるので ESP 上ではなく Mac mini 側に退避した（ESP の空きは 71MB）。
+中の `EFI/OC/config.plist` と `EFI/BOOT/config.plist` は既知良好の
+`5623ac3bf71d6536…`。
+
+### 副産物: 「OpenCore ログが 05:20:03 以降出ない」謎の解決
+
+ログは出ていた。`uptime` が 3 分で、直前の macOS セッションは 05:20 から**連続稼働**
+していたので、その間そもそも再起動が無かっただけ。今回の起動で
+`opencore-2026-08-18-162144.txt` が生成されている。
