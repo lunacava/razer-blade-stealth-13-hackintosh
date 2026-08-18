@@ -59,7 +59,20 @@ CNVi (Integrated Connectivity) は、MACをPCH内部に置き、M.2スロット�
 
 これは「WiFiカードを買って差し替える」計画の前提を崩す。→ 別途対処方針が必要（下記「未解決課題」参照）。
 
-Bluetooth 側: USB `VID_8087` が見えず、CNVi の BT も PCH 経由。
+Bluetooth 側: Windows 側の調査では USB `VID_8087` が見えなかったが、これは**誤り**だった。
+**macOS では XHCI のポート8に `8087:0AAA` としてはっきり列挙される**（2026-08-18 実測）。
+CNVi の BT は内部的に USB でぶら下がっている。そして動作している:
+
+```
+Bluetooth Controller:  Address FC:77:74:85:D8:82   State: On
+Chipset: THIRD_PARTY_DONGLE   Transport: USB   Firmware Version: v256 c256
+Supported services: 0x392039 < HFP AVRCP A2DP HID Braille LEA AACP GATT SerialPort >
+```
+
+`IntelBluetoothFirmware` 2.4.0 + `BlueToolFixup` 2.7.2 で対応済み。ioreg 上の
+ノード名が `IOUSBHostDevice@14800000` と無名なのは USB の Product String を
+持たないだけで、`registered, matched, active` = ドライバは一致している。
+**無名を「ドライバ未一致」と読み違えないこと。**
 
 ## ★ 重大な発見 2: スリープ修正パッチは適用可能（ただし vampjaz とは別パターン）
 
@@ -142,6 +155,26 @@ PCH xHCI (00:14.0) 配下:
 | SS14 | Generic SuperSpeed Hub (05E3:0626) |
 
 TB3 xHCI (59:00.0) は別コントローラ。USBMap は macOS 上で実施が必要（Windows側だけでは全ポート判定不可）。
+
+#### macOS 側から見たポート番号（2026-08-18 実測、USBMap 未実施の素の状態）
+
+コントローラは `XHC@14000000`（`AppleIntelCNLUSBXHCI`、locationID 335544320）**1つだけ**。
+TB3 側の xHCI は Thunderbolt を Block しているため列挙されない。
+
+| PortNum | locationID | VID:PID | デバイス | 内蔵/外付 |
+|---|---|---|---|---|
+| 2 | 337641472 | 214E:0004 | GesturePoint Mouse Dongle | 外付 |
+| 3 | 338690048 | 05E3:0610 | USB2.1 Hub (Genesys) | 外付 |
+| **4** | 339738624 | **13D3:56D5** | **内蔵カメラ** | 内蔵 |
+| **6** | 341835776 | **1532:0239** | **内蔵キーボード + Razer Chroma** | 内蔵 |
+| **8** | 343932928 | **8087:0AAA** | **Intel Bluetooth (CNVi)** | 内蔵 |
+| 11 | 347078656 | 05E3:0626 | USB3.1 Hub (Genesys) → 配下に AX88179A (0B95:1790) | 外付 |
+
+**Windows の HSxx 番号と macOS の PortNum は一致しない。** カメラは Windows で HS06 だが
+macOS では PortNum 4、キーボードは Windows HS08 に対し macOS では 6。
+USB マッピングを実施する理由がまさにこれ。
+
+内蔵は 4 / 6 / 8 の3つで確定。残りは物理ポートで、Ethernet は Genesys ハブ経由。
 
 ### Windows 動作が重い原因（仮想デバイスの山）
 Display クラスに実画面以外が2つ、加えて多数の仮想バス:
