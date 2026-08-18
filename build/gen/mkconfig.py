@@ -34,6 +34,31 @@ KEXTS = [
     ("IntelBluetoothFirmware.kext", "Contents/MacOS/IntelBluetoothFirmware"),
     ("IntelBTPatcher.kext",         "Contents/MacOS/IntelBTPatcher"),
     ("BlueToolFixup.kext",          "Contents/MacOS/BlueToolFixup"),
+    # USB port map.  This PCH xHCI (8086:9DED, \_SB.PCI0.XHC) declares 18 ports
+    # but macOS only accepts 15, so the ports have to be declared explicitly
+    # rather than relying on XhciPortLimit (which is a Catalina-era hack and is
+    # left False below).  UTBMap.kext is codeless -- Info.plist only -- and
+    # declares OSBundleLibraries on com.dhinakg.USBToolBox.kext, so
+    # USBToolBox.kext MUST be injected first.
+    #
+    # The nine ports in the map come from the ACPI _UPC/_PLD data that
+    # USBToolBox's usbdump reads on the Windows side (see docs/hardware-
+    # findings.md 発見 16), NOT from guessing:
+    #   HS01=1  SS01=13  UsbConnector 9   USB-C          (_PLD type_c, guessed 9)
+    #   HS02=2  SS02=14  UsbConnector 3   USB-A #1
+    #   HS03=3  SS03=15  UsbConnector 3   USB-A #2
+    #   HS04=6           UsbConnector 255 camera         13D3:56D5
+    #   HS05=8           UsbConnector 255 keyboard/Chroma 1532:0239
+    #   HS06=10          UsbConnector 255 Bluetooth      8087:0AAA
+    # Every other port on the controller reports user_connectable false with no
+    # device ever seen, so it is deliberately absent -- with a map applied,
+    # anything not listed is disabled, which is the point.
+    #
+    # NOT covered: the TB3 controller (8086:15DB, RP09/PXSX, 4 ports).  It has
+    # no personality here because IOThunderboltFamily is blocked below; if that
+    # Block is ever lifted, that controller needs its own map.
+    ("USBToolBox.kext",             "Contents/MacOS/USBToolBox"),
+    ("UTBMap.kext",                 ""),
     # VoodooI2C ships its dependencies inside Contents/PlugIns.  OpenCore does
     # NOT walk PlugIns -- it injects exactly the bundles listed here -- so each
     # plugin needs its own entry or VoodooI2C dies at boot with

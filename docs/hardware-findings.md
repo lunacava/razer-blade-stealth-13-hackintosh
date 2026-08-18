@@ -59,9 +59,20 @@ CNVi (Integrated Connectivity) は、MACをPCH内部に置き、M.2スロット�
 
 これは「WiFiカードを買って差し替える」計画の前提を崩す。→ 別途対処方針が必要（下記「未解決課題」参照）。
 
-Bluetooth 側: Windows 側の調査では USB `VID_8087` が見えなかったが、これは**誤り**だった。
-**macOS では XHCI のポート8に `8087:0AAA` としてはっきり列挙される**（2026-08-18 実測）。
-CNVi の BT は内部的に USB でぶら下がっている。そして動作している:
+Bluetooth 側: 当初「Windows 側の調査では USB `VID_8087` が見えない」と記録したが、
+これは**検索が不十分だっただけ**だった（2026-08-18 再確認）。Windows でも見える:
+
+```
+Status Class      FriendlyName                    InstanceId
+OK     Bluetooth  インテル(R) ワイヤレス Bluetooth(R)  USB\VID_8087&PID_0AAA\5&1A1FDAD1&0&10
+                                                                                        ^^ port 10
+```
+
+`Get-PnpDevice -Class USB` で絞ると**漏れる**。この device の Class は `USB` ではなく
+`Bluetooth` だからである。`-Class` で絞らず `InstanceId -match 'VID_8087'` で探すこと。
+
+macOS 側では XHCI の **PortNum 8** に `8087:0AAA` として列挙される。
+つまり CNVi の BT は内部的に USB でぶら下がっており、両 OS で見える。そして動作している:
 
 ```
 Bluetooth Controller:  Address FC:77:74:85:D8:82   State: On
@@ -1620,3 +1631,119 @@ UTF-8 として解釈されて文字化けする。
 
 PowerShell のコマンドレット（`Get-CimInstance` 等）の出力は化けない。
 **ネイティブコマンドは出力本文を読まず、`$LASTEXITCODE` で判定するのが確実。**
+
+---
+
+## ★★ 発見 16: USB ポートマップ — USBToolBox は `type` ではなく `selected` を見る（2026-08-18 16:05-16:20）
+
+macOS の XHCI は 1 コントローラあたり **15 ポート**までしか受け付けないが、この PCH
+xHCI（`8086:9DED`、ACPI `\_SB.PCI0.XHC`）は **18 ポート**申告する。`XhciPortLimit`
+は Catalina 以前向けの手抜きなので `false` のまま、ポートを明示宣言する方針を採った。
+
+### ポート構成は ACPI `_UPC` / `_PLD` から確定した（差し替え実験なしで）
+
+USBToolBox の `usbdump` が Windows 側で読む `_UPC`/`_PLD` は、`user_connectable`
+`type_c` `companion_info` `guessed` を返す。これで物理コネクタ配置が全部割れた。
+
+| index | class | UsbConnector | 物理 | 根拠 |
+|---|---|---|---|---|
+| 1 | HS | 9 | USB-C | `type_c=True` `uc=True` `guessed=9`、companion=13 |
+| 13 | SS | 9 | USB-C | `type_c=True` `uc=True` `guessed=9`、companion=1 |
+| 2 | HS | 3 | USB-A ① | `uc=True` `guessed=3`、companion=14 |
+| 14 | SS | 3 | USB-A ① | companion=2 |
+| 3 | HS | 3 | USB-A ② | `uc=True` `guessed=3`、companion=15 |
+| 15 | SS | 3 | USB-A ② | companion=3 |
+| 6 | HS | 255 | 内蔵カメラ | `uc=False` `guessed=255`、`13D3:56D5` |
+| 8 | HS | 255 | 内蔵キーボード + Chroma | `uc=False`、`1532:0239` |
+| 10 | HS | 255 | 内蔵 Bluetooth | `uc=False`、`8087:0AAA` |
+
+残る 9 ポート（4,5,7,9,11,12,16,17,18）は全て `user_connectable=False` かつ
+デバイス履歴なし。**マップを適用すると載っていないポートは無効化される**ので、
+これは意図的な除外。
+
+UsbConnector の値: **3** = USB3 Type-A、**9** = Type-C（スイッチ付き）、
+**255** = 内蔵/独自。
+
+### ★ 罠: `usb.json` の `type` を書いても選択されない
+
+`usb.json` を手で編集して 9 ポートに `type` を入れ、ツールに kext を作らせたところ、
+**7 ポートしか出力されず、USB-C の 2 ポート（index 1 と 13）が落ちた。**
+
+原因はツールのソースにある（[base.py:296](https://github.com/USBToolBox/tool/blob/master/base.py#L296)、
+[base.py:591](https://github.com/USBToolBox/tool/blob/master/base.py#L591)）:
+
+```python
+# select_ports(): 採否は "selected" で決まる
+if "selected" not in port:
+    port["selected"] = bool(port["devices"])
+    port["selected"] = port["selected"] or bool(self.get_companion_port(port)["devices"])
+
+# build_kext():
+for port in controller["ports"]:
+    if not port["selected"]:
+        continue
+    ...
+    "UsbConnector": port["type"] or port["guessed"],
+```
+
+つまり:
+
+* 採否のフラグは **`selected`**。`type` は「採用されたポートの UsbConnector 値」
+  にしか効かない（未指定なら `guessed` にフォールバック）。
+* `selected` の自動判定は「そのポートにデバイスが挿さっている」か
+  「companion に挿さっている」かだけ。
+* → port 2,3,6,8,10 はデバイス有りで採用。port 14,15 は companion(2,3) 有りで採用。
+  **port 1,13 は USB-C に何も挿していなかったので不採用。**
+
+`usb.json` を手編集する場合は **`"selected": true` も書く**こと。`type` だけでは
+足りない。（`"selected" not in port` のガードがあるので、明示すれば尊重される。）
+
+もう一点: **ツールは kext 生成後に `usb.json` を書き戻し、`type` を全部 null に消す。**
+生成後の `usb.json` は「何を作ったか」の証拠にならない（16383 → 18368 バイト、
+mtime は kext より 10 秒後）。
+
+### 出力の命名は連番で、実 index は `port` データ側にある
+
+`HS01`…/`SS01`… はコントローラのポート列を上から数えた連番のラベルにすぎず、
+実際のポート番号は `port` の 4 バイト **リトルエンディアン** に入る。
+`port-count` は「採用したポートの最大 index」（ポート数ではない）。
+
+```
+HS01 port=<01000000> UsbConnector 9    ← index 1
+HS06 port=<0a000000> UsbConnector 255  ← index 10
+SS01 port=<0d000000> UsbConnector 9    ← index 13
+port-count = <0f000000>                ← 最大 index 15
+```
+
+### 最終的に採った手段
+
+ツールに作らせ直すには USB-C にデバイスを挿して再実行する必要があるが、判断材料は
+ファームウェアの申告で既に揃っていたので、**全 9 ポート採用時にツールが出すはずの
+Info.plist を同じロジックで組み直した**（index 順に連番、`port` は LE、`port-count`
+は最大 index）。ツールが出した 7 ポート版は `/tmp/utb/UTBMap.kext.tool-7port` に残した。
+
+### kext の投入順序
+
+`UTBMap.kext` は **コードレス**（`Contents/Info.plist` のみ、`ExecutablePath` 空）で、
+`OSBundleLibraries` に `com.dhinakg.USBToolBox.kext` を宣言する。よって
+**`USBToolBox.kext` を先に注入しないと依存解決に失敗する**。`mkconfig.py` の
+`KEXTS` はこの順で並べてある。
+
+### `IONameMatch` が当たる根拠
+
+生成された personality は `IONameMatch = "XHC"`（Windows 側 ACPI パス
+`\_SB.PCI0.XHC` の末尾から導出）。macOS の ioreg でも同じノード名
+`XHC@14000000` で見えている（発見 1 参照）ので一致する。**別名だった場合は
+kext が当たらず無言で効かない**ので、名前依存であることは覚えておく。
+
+### 未対応として明示しておく箇所
+
+**TB3 コントローラ（`8086:15DB`、ACPI `RP09/PXSX`、4 ポート）はマップしていない。**
+`IOThunderboltFamily` を Block しているうちは macOS から見えないため。Block を
+外すなら、このコントローラ用の personality を別途作る必要がある。
+
+### 現状: まだ検証していない
+
+ESP への配置は macOS 側からの作業なので、この時点では repo（`build/EFI/`）に
+入れただけ。実機の ioreg で 9 ポートが期待どおり生えるかは未確認。
+config hash は `5623ac3bf71d6536` → `785d247bb29ba101`。
