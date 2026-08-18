@@ -1457,7 +1457,7 @@ Target: x86_64-apple-macosx14.0
 xcode-select -p → /Library/Developer/CommandLineTools
 ```
 
-### 直し方
+### 直し方 — **実施・検証済み（2026-08-18 15:20）**
 
 古い方を削除ではなく改名する（中身が同一なので戻せる）。
 
@@ -1465,3 +1465,15 @@ xcode-select -p → /Library/Developer/CommandLineTools
 sudo mv /Library/Developer/CommandLineTools/usr/include/swift/module.modulemap \
         /Library/Developer/CommandLineTools/usr/include/swift/module.modulemap.disabled
 ```
+
+適用後の確認:
+
+```
+$ printf 'import Foundation\nprint("swift-ok", ProcessInfo.processInfo.hostName)\n' > /tmp/t.swift
+$ swiftc -o /tmp/t /tmp/t.swift     → rc=0
+$ /tmp/t                            → swift-ok hirokis-macbook-pro.local
+```
+
+`import Foundation` を含むプログラムがエラーなしで通る。**これで原因の切り分けも裏取りできた**
+（重複 modulemap 1ファイルの除去だけで直った）。以後、macOS 側で小さな検証プログラムを
+書いて実機を調べる手が使える。
