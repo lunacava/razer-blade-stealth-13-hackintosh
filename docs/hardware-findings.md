@@ -76,7 +76,7 @@ macOS 側でも XHCI の **port 10**（ノード `HS10`、Windows の root hub p
 つまり CNVi の BT は内部的に USB でぶら下がっており、両 OS で見える。そして動作している:
 
 ```
-Bluetooth Controller:  Address FC:77:74:85:D8:82   State: On
+Bluetooth Controller:  Address <BD_ADDR>   State: On
 Chipset: THIRD_PARTY_DONGLE   Transport: USB   Firmware Version: v256 c256
 Supported services: 0x392039 < HFP AVRCP A2DP HID Braille LEA AACP GATT SerialPort >
 ```
@@ -3314,7 +3314,7 @@ Wi-Fi 経由でスリープ→復帰→Wi-Fi 経由で再接続を直接試す�
 networksetup -setairportpower en0 off; sleep 3; networksetup -setairportpower en0 on
 ```
 
-これで `status: active` / `Current Wi-Fi Network: elecom-4e2303a` に戻り、
+これで `status: active` / `Current Wi-Fi Network: <自宅 SSID>` に戻り、
 ping 0% loss、SSH も通る。再起動は不要。
 
 ### 教訓: 「落ちていない」の観測は「落ちない」の証拠にならない
@@ -3348,8 +3348,8 @@ macOS と Windows が同じ IP を共有しているため、OS を切り替え�
 `StrictHostKeyChecking=no` で潰してはいけない）:
 
 ```
-Wi-Fi で提示   SHA256:hjtOpmZvVJN5qiFJOm7cLyUbHYlIh8VNL5RG1d9ChSs
-有線経由で実体 SHA256:hjtOpmZvVJN5qiFJOm7cLyUbHYlIh8VNL5RG1d9ChSs (ED25519) ✅
+Wi-Fi で提示   SHA256:<ED25519 指紋>            # 実際の値は公開記録から除去
+有線経由で実体 SHA256:<同一の ED25519 指紋> ✅   # 1 文字も違わず一致
 ```
 
 恒久対処は `~/.ssh/config` で `HostKeyAlias` を分けること（`razer-macos` / `razer-windows`）。
