@@ -1,8 +1,8 @@
 # Razer Blade Stealth 13 (RZ09-02812E71) — macOS Sonoma / OpenCore
 
 OpenCore configuration and engineering notes for running **macOS Sonoma 14.6.1**
-on a **Razer Blade Stealth 13 late-2018 (RZ09-02812E71)**, dual-booting with
-Windows 11 on the same NVMe SSD.
+on a **Razer Blade Stealth 13 late-2018 (RZ09-02812E71)**, sharing the one NVMe
+SSD with Windows 11 and Omarchy Linux.
 
 Everything here was derived from *this* machine's own firmware dumps and boot
 logs, not copied from a guide for a different laptop. Where a setting is
@@ -134,6 +134,8 @@ docs/hardware-findings.md  Per-device investigation log: what was tried, what th
 docs/install-runbook.md  Step-by-step install procedure, incl. component versions
                          and SHA-256 hashes.
 docs/bios-settings.md    Required BIOS screens.
+docs/omarchy-triple-boot.md  Adding Omarchy Linux as a third OS: measured APFS
+                         shrink, the installer's ESP behaviour, Limine setup.
 docs/network-sharing.md  Internet-sharing setup used to drive the install remotely.
 dumps/acpi/              This machine's ACPI tables (DSDT/SSDT, AML + decompiled).
                          The evidence base for everything above.
@@ -192,11 +194,18 @@ OpenCore 1.0.7, BIOS 1.01 (never flashed).
 
 Boot-args: `-v debug=0x100 keepsyms=1 alcid=30 -igfxblt -btlfxboardid`
 
+**Now a triple boot**: Windows 11 / macOS / Omarchy Linux 4.0.3 on the one NVMe,
+selected from Limine. The APFS container was shrunk 623 GB → 400 GB to free
+223 GB; Omarchy created its own 2 GiB ESP and left both existing ESPs
+(`SYSTEM`, `OCESP`) untouched. OpenCore keeps its own NVRAM entry, so `F12` →
+`UEFI OS` still boots macOS directly if Limine ever breaks. See
+`docs/omarchy-triple-boot.md`.
+
 ### Working
 
 | Area | Notes |
 |---|---|
-| NVMe / APFS / RTC | Dual-boot with Windows 11 on the same disk |
+| NVMe / APFS / RTC | Triple-boot with Windows 11 and Omarchy Linux on the same disk |
 | Battery percentage | ECEnabler — the 16-bit EC field is the cause (finding 4) |
 | Wi-Fi | AirportItlwm (native UI). No AirDrop/Handoff/Sidecar — Broadcom-only features. **Intermittently does not survive sleep/wake** (finding 25); recover with `networksetup -setairportpower en0 off/on`. This is why the wired link to the Mac mini stays |
 | Audio | AppleALC `alcid=30` |
